@@ -49,11 +49,22 @@ impl World {
             .collect()
     }
 
+    /// Apply a change to the state file, writing it only if something changed.
     fn update_state(
         &self,
         change: impl Fn(&[state::Started]) -> Vec<state::Started>,
     ) -> Result<()> {
-        state::update(&self.fs, &self.env.state_file, change)
+        let path = &self.env.state_file;
+        let before = state::load(&self.fs, path);
+        let after = change(&before);
+        if after == before {
+            return Ok(());
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&after)?)?;
+        Ok(())
     }
 }
 

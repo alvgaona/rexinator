@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::env::{self, Env};
 use crate::fs::Fs;
 use crate::layout;
-use crate::model::{Direction, Hooks, Node, Pane, Project, Window};
+use crate::model::{Direction, Hooks, Node, NonEmpty, Pane, Project, Window};
 use crate::vars::{self, Lookup};
 use crate::when::truthy;
 use crate::yaml::{self, check_keys, commands, scalar};
@@ -573,9 +573,9 @@ fn parse_panes(m: &Mapping, base: &Path, home: &Path) -> Result<Option<Node>> {
         .into_iter()
         .flatten()
         .collect();
-    if panes.is_empty() {
+    let Some(panes) = NonEmpty::from_vec(panes) else {
         return Ok(None);
-    }
+    };
     let spec = match m.get("layout") {
         Some(l) => scalar(l, "layout")?,
         None => "even-vertical".to_string(),

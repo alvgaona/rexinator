@@ -3,9 +3,9 @@
 //! came from variables.
 //!
 //! The record is a list of [`Started`] values. Changes are pure functions
-//! from one list to the next; [`load`] and [`save`] are the only I/O.
+//! from one list to the next. [`load`] reads it through an [`Fs`]; the
+//! commands write it back.
 
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -50,25 +50,6 @@ pub fn without(all: &[Started], session_id: &str) -> Vec<Started> {
 /// The records in `path`. A missing file means none.
 pub fn load(fs: &Fs, path: &Path) -> Vec<Started> {
     (fs.read)(path).map(|t| parse(&t)).unwrap_or_default()
-}
-
-pub fn save(path: &Path, all: &[Started]) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, serde_json::to_string_pretty(all)?)?;
-    Ok(())
-}
-
-/// Apply `change` to the records in `path` and write them back, if it changed anything.
-pub fn update(fs: &Fs, path: &Path, change: impl Fn(&[Started]) -> Vec<Started>) -> Result<()> {
-    let before = load(fs, path);
-    let after = change(&before);
-    if after == before {
-        Ok(())
-    } else {
-        save(path, &after)
-    }
 }
 
 #[cfg(test)]

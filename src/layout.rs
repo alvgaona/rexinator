@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 
-use crate::model::{Direction, Node, Pane, Project, Window};
+use crate::model::{Direction, Node, NonEmpty, Pane, Project, Window};
 
 const TERMINAL: &str = "com.superlogical.terminal.shell";
 
@@ -16,8 +16,7 @@ pub const PRESETS: &[&str] = &[
 ];
 
 /// Build a split tree from a preset name, such as `main-left` or `main-left 70`.
-/// `panes` must not be empty.
-pub fn preset(spec: &str, panes: Vec<Node>) -> Result<Node> {
+pub fn preset(spec: &str, panes: NonEmpty<Node>) -> Result<Node> {
     let words: Vec<&str> = spec.split_whitespace().collect();
     let (name, size) = match words.as_slice() {
         [] => ("", None),
@@ -51,40 +50,32 @@ fn main_size(spec: &str, word: &str) -> Result<f64> {
 
 /// The first pane takes `ratio` of the space; the rest share what's left,
 /// laid out across the other direction.
-fn main(panes: Vec<Node>, direction: Direction, ratio: f64) -> Node {
-    let mut rest = panes.into_iter();
-    let first = rest.next().expect("a layout has at least one pane");
-    let rest: Vec<Node> = rest.collect();
-    if rest.is_empty() {
-        first
-    } else {
-        Node::split(direction, ratio, first, even(rest, direction.other()))
+fn main(panes: NonEmpty<Node>, direction: Direction, ratio: f64) -> Node {
+    match NonEmpty::from_vec(panes.tail) {
+        None => panes.head,
+        Some(rest) => Node::split(direction, ratio, panes.head, even(rest, direction.other())),
     }
 }
 
 /// Rows of equal panes, as close to a square grid as the count allows.
-fn tiled(panes: Vec<Node>) -> Node {
+fn tiled(panes: NonEmpty<Node>) -> Node {
     let cols = (panes.len() as f64).sqrt().ceil() as usize;
     let rows = panes
         .chunks(cols)
-        .map(|row| even(row.to_vec(), Direction::Horizontal))
-        .collect();
+        .map(|row| even(row, Direction::Horizontal));
     even(rows, Direction::Vertical)
 }
 
-/// Equal-sized panes in a row or column. Built from the end: a pane in front
-/// of `count` others gets 1/(count + 1) of the space.
-fn even(nodes: Vec<Node>, direction: Direction) -> Node {
-    nodes
-        .into_iter()
-        .rev()
-        .map(|node| (node, 1))
-        .reduce(|(after, count), (before, _)| {
-            let ratio = 1.0 / (count + 1) as f64;
-            (Node::split(direction, ratio, before, after), count + 1)
-        })
-        .map(|(node, _)| node)
-        .expect("a layout has at least one pane")
+/// Equal-sized panes in a row or column: the first of n panes gets 1/n of
+/// the space, and the rest share what's left the same way.
+fn even(nodes: NonEmpty<Node>, direction: Direction) -> Node {
+    match NonEmpty::from_vec(nodes.tail) {
+        None => nodes.head,
+        Some(rest) => {
+            let ratio = 1.0 / (rest.len() + 1) as f64;
+            Node::split(direction, ratio, nodes.head, even(rest, direction))
+        }
+    }
 }
 
 impl Direction {
@@ -163,15 +154,16 @@ fn block_json(p: &Pane) -> Value {
 mod tests {
     use super::*;
 
-    fn panes(n: usize) -> Vec<Node> {
-        (0..n)
+    fn panes(n: usize) -> NonEmpty<Node> {
+        let nodes = (0..n)
             .map(|i| {
                 Node::Pane(Pane {
                     typed: vec![format!("p{i}")],
                     ..Default::default()
                 })
             })
-            .collect()
+            .collect();
+        NonEmpty::from_vec(nodes).unwrap()
     }
 
     /// Render a tree compactly, e.g. `H(p0,V(p1,p2))`.
