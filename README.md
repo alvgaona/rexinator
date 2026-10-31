@@ -1,5 +1,12 @@
 # rexinator
 
+[![CI](https://github.com/alvgaona/rexinator/actions/workflows/ci.yaml/badge.svg)](https://github.com/alvgaona/rexinator/actions/workflows/ci.yaml)
+[![Crates.io](https://img.shields.io/crates/v/rexinator.svg)](https://crates.io/crates/rexinator)
+[![Downloads](https://img.shields.io/crates/d/rexinator.svg)](https://crates.io/crates/rexinator)
+[![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg?logo=rust)](https://doc.rust-lang.org/edition-guide/rust-2024/)
+[![Pixi](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/prefix-dev/pixi/main/assets/badge/v0.json)](https://pixi.sh)
+[![License](https://img.shields.io/crates/l/rexinator.svg)](#license)
+
 Start Rex sessions from project files, like tmuxinator does for tmux.
 
 ```sh
