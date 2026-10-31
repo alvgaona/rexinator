@@ -191,6 +191,54 @@ pub fn list_row(name: &str, project: Option<(&Project, &[&str])>) -> [String; 4]
     }
 }
 
+/// What `check` found in one project file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Checked {
+    pub name: String,
+    /// How many layouts were checked; 0 for a file without `layouts`.
+    pub layouts: usize,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Judge a project file from the result of loading it with each layout
+/// (`None` for a file without layouts).
+pub fn check(
+    name: &str,
+    loads: &[(Option<String>, Result<Project, String>)],
+    is_dir: impl Fn(&Path) -> bool,
+) -> Checked {
+    let errors = loads
+        .iter()
+        .filter_map(|(layout, result)| {
+            let error = result.as_ref().err()?;
+            Some(match layout {
+                Some(l) => format!("layout `{l}`: {error}"),
+                None => error.clone(),
+            })
+        })
+        .collect();
+    let missing: BTreeSet<String> = loads
+        .iter()
+        .filter_map(|(_, result)| result.as_ref().ok())
+        .flat_map(|p| missing_dirs(p, &is_dir))
+        .collect();
+    let warnings = if missing.is_empty() {
+        vec![]
+    } else {
+        vec![format!(
+            "these folders don't exist here: {}",
+            missing.into_iter().collect::<Vec<_>>().join(", ")
+        )]
+    };
+    Checked {
+        name: name.to_string(),
+        layouts: loads.iter().filter(|(l, _)| l.is_some()).count(),
+        errors,
+        warnings,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +370,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["s1", "s2"]
         );
+    }
+
+    #[test]
+    fn check_collects_errors_per_layout_and_missing_folders() {
+        let loads = vec![
+            (Some("full".to_string()), Ok(project("shop"))),
+            (
+                Some("focus".to_string()),
+                Err("unknown variable `x`".to_string()),
+            ),
+        ];
+        let c = check("shop", &loads, |d| d != Path::new("/p/logs"));
+        assert_eq!(c.layouts, 2);
+        assert_eq!(c.errors, ["layout `focus`: unknown variable `x`"]);
+        assert_eq!(c.warnings, ["these folders don't exist here: /p/logs"]);
+
+        let c = check("plain", &[(None, Ok(project("plain")))], |_| true);
+        assert_eq!((c.layouts, c.errors.len(), c.warnings.len()), (0, 0, 0));
+        let c = check("bad", &[(None, Err("broken".into()))], |_| true);
+        assert_eq!(c.errors, ["broken"]);
     }
 
     #[test]

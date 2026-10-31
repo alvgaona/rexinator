@@ -40,6 +40,32 @@ pub fn no_projects(config_dir: &str) -> String {
     format!("No projects in {config_dir}. Create one with {BOLD}rexinator new NAME{RESET}.")
 }
 
+/// `check`'s lines for one project: ok, or each error and warning.
+pub fn checked(c: &crate::plan::Checked) -> String {
+    let name = format!("{BOLD}{}{RESET}", c.name);
+    let ok = c.errors.is_empty().then(|| {
+        let layouts = match c.layouts {
+            0 => String::new(),
+            n => format!(" {DIM}({}){RESET}", plural(n, "layout")),
+        };
+        format!("{GREEN}ok{RESET}      {name}{layouts}\n")
+    });
+    let errors = c
+        .errors
+        .iter()
+        .map(|e| format!("{RED}error{RESET}   {name}: {e}\n"));
+    let warnings = c
+        .warnings
+        .iter()
+        .map(|w| format!("{YELLOW}warning{RESET} {name}: {w}\n"));
+    ok.into_iter().chain(errors).chain(warnings).collect()
+}
+
+/// The last line of a `check` that found no errors.
+pub fn check_summary(checked: usize) -> String {
+    format!("{DIM}Checked {}{RESET}", plural(checked, "project"))
+}
+
 pub fn warning(msg: &str) -> String {
     format!("{BOLD}{YELLOW}warning:{RESET} {msg}")
 }
@@ -122,6 +148,27 @@ mod tests {
             plain(&added("shop", 3)),
             "Added 3 windows from shop to this session"
         );
+    }
+
+    #[test]
+    fn check_lines() {
+        let c = crate::plan::Checked {
+            name: "shop".into(),
+            layouts: 2,
+            errors: vec![],
+            warnings: vec!["missing".into()],
+        };
+        assert_eq!(
+            plain(&checked(&c)),
+            "ok      shop (2 layouts)\nwarning shop: missing\n"
+        );
+        let c = crate::plan::Checked {
+            errors: vec!["bad".into()],
+            warnings: vec![],
+            ..c
+        };
+        assert_eq!(plain(&checked(&c)), "error   shop: bad\n");
+        assert_eq!(plain(&check_summary(3)), "Checked 3 projects");
     }
 
     #[test]

@@ -55,11 +55,30 @@ pub enum Cmd {
         #[command(flatten)]
         target: Target,
     },
+    /// Stop a project's session if it's running, then start it again
+    ///
+    /// Picks up changes to the project file. Runs on_stop, then the start hooks.
+    Restart {
+        /// Don't switch the Rex app to the session
+        #[arg(long)]
+        no_show: bool,
+        #[command(flatten)]
+        target: Target,
+    },
     /// Close a project's session and run its on_stop commands
     Stop {
         /// Stop every project that's running
         #[arg(long)]
         all: bool,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Check project files for mistakes, without starting anything
+    ///
+    /// With no project, checks every project here and in the config folder.
+    /// Each layout is checked unless you pick one with @LAYOUT. Exits with 1
+    /// if any file has errors; missing folders are only warnings.
+    Check {
         #[command(flatten)]
         target: Target,
     },

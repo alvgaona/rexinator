@@ -238,6 +238,66 @@ pub fn stop_all(world: &World) -> Result<()> {
     Ok(())
 }
 
+/// Stop the session if it's running, then start it.
+pub fn restart(world: &World, loaded: &Loaded, show: bool) -> Result<()> {
+    stop(world, &loaded.project)?;
+    start(world, loaded, show)
+}
+
+/// Check one project (with the target's variables and layout), or every
+/// project when the target names none.
+pub fn check(world: &World, target: &Target) -> Result<()> {
+    let (name, request) = crate::cli::parse_target(&target.args)?;
+    let files = match &name {
+        None if request == Request::default() => discovery::all_projects(&world.fs, &world.env),
+        _ => {
+            let path = discovery::find_project(&world.fs, &world.env, name.as_deref())?;
+            vec![(name.unwrap_or_else(|| "(here)".to_string()), path)]
+        }
+    };
+    if files.is_empty() {
+        let dir = world.env.config_dir.display().to_string();
+        println!("{}", report::no_projects(&dir));
+        return Ok(());
+    }
+    let results: Vec<plan::Checked> = files
+        .iter()
+        .map(|(name, path)| check_file(world, name, path, &request))
+        .collect();
+    results
+        .iter()
+        .for_each(|c| print!("{}", report::checked(c)));
+    match results.iter().filter(|c| !c.errors.is_empty()).count() {
+        0 => {
+            println!("{}", report::check_summary(results.len()));
+            Ok(())
+        }
+        failed => bail!("{} of {} have errors", failed, results.len()),
+    }
+}
+
+/// Load a project file once per layout and judge the results.
+fn check_file(world: &World, name: &str, path: &Path, request: &Request) -> plan::Checked {
+    let first = world.load(path, request);
+    let layouts: Vec<Option<String>> = match (&request.layout, &first) {
+        (Some(l), _) => vec![Some(l.clone())],
+        (None, Ok(p)) if !p.layouts.is_empty() => p.layouts.iter().cloned().map(Some).collect(),
+        (None, _) => vec![None],
+    };
+    let loads: Vec<_> = layouts
+        .into_iter()
+        .map(|layout| {
+            let request = Request {
+                layout: layout.clone(),
+                ..request.clone()
+            };
+            let result = world.load(path, &request).map_err(|e| format!("{e:#}"));
+            (layout, result)
+        })
+        .collect();
+    plan::check(name, &loads, |d| (world.fs.is_dir)(d))
+}
+
 pub fn debug(loaded: &Loaded) -> Result<()> {
     let request = layout::session_request(&loaded.project);
     println!("{}", serde_json::to_string_pretty(&request)?);

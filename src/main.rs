@@ -68,6 +68,10 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Start {
             no_show, target, ..
         } => commands::start(&world, &commands::load(&world, &target)?, !no_show),
+        Cmd::Restart { no_show, target } => {
+            commands::restart(&world, &commands::load(&world, &target)?, !no_show)
+        }
+        Cmd::Check { target } => commands::check(&world, &target),
         Cmd::Stop { all: true, target } => {
             if !target.args.is_empty() || target.name.is_some() {
                 anyhow::bail!("--all doesn't take a project");
