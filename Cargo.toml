@@ -8,6 +8,7 @@ repository = "https://github.com/alvgaona/rexinator"
 readme = "README.md"
 keywords = ["rex", "tmuxinator", "terminal", "session", "workspace"]
 categories = ["command-line-utilities", "development-tools"]
+include = ["/src/**", "/README.md", "/LICENSE-*", "/Cargo.toml", "/Cargo.lock"]
 
 [dependencies]
 anstream = "1"

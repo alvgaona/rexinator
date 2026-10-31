@@ -35,6 +35,19 @@ The code is split into a pure core and a thin shell. Parsing, discovery and deci
 functions, and only `commands.rs` and `rex.rs` run programs, write files or print. Keep new logic
 in the core, and test it there.
 
+## Releasing
+
+1. Preview the release notes with `pixi run -e release changelog`.
+2. Bump `version` in `Cargo.toml`, then commit it as `chore(release): prepare for vX.Y.Z`.
+3. Tag the commit and push the tag:
+
+   ```sh
+   git tag vX.Y.Z && git push origin vX.Y.Z
+   ```
+
+The release workflow checks that the tag matches the version in `Cargo.toml`, creates a GitHub
+release with notes from git-cliff, and publishes the crate to crates.io.
+
 ## License
 
 Unless you say otherwise, any contribution you submit for inclusion in rexinator, as defined in the

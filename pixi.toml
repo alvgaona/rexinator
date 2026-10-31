@@ -38,5 +38,13 @@ description = "Run the pre-commit checks on every file"
 cmd = "commitlint --last --verbose"
 description = "Check the last commit's message"
 
+[feature.release.dependencies]
+git-cliff = ">=2.14"
+
+[feature.release.tasks.changelog]
+cmd = "git-cliff --unreleased --strip header"
+description = "Preview the release notes for the next tag"
+
 [environments]
 lint = { features = ["lint"], no-default-feature = true }
+release = { features = ["release"], no-default-feature = true }
