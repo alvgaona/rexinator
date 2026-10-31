@@ -3,6 +3,11 @@ name = "rexinator"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+description = "Start Rex terminal sessions from YAML project files, like tmuxinator for tmux"
+repository = "https://github.com/alvgaona/rexinator"
+readme = "README.md"
+keywords = ["rex", "tmuxinator", "terminal", "session", "workspace"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anstream = "1"
