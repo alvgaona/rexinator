@@ -15,6 +15,10 @@ rexinator stop            # close it
 rexinator list            # projects, and which are running
 ```
 
+`rexinator --help` lists every command.
+
+### Example
+
 ```yaml
 # .rexinator.yml
 vars:
@@ -31,10 +35,11 @@ windows:
 
 Override variables on the command line: `rexinator start port=4000`.
 
-See [examples/tiny-shop](examples/tiny-shop) for a fuller example, and `rexinator --help` for
-every command.
+See [examples/tiny-shop](examples/tiny-shop) for a fuller example.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) to work on rexinator.
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
