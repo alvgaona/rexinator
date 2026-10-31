@@ -484,14 +484,18 @@ fn merge(base: &mut Mapping, top: Mapping) {
     }
 }
 
-/// Whether a `when` value switches something on. Off: false, no, off, 0,
-/// empty. A leading `!` flips it.
+/// Whether a `when` value switches something on. `A == B` and `A != B`
+/// compare text. Otherwise it's off for false, no, off, 0 and empty, and a
+/// leading `!` flips it.
 fn truthy(v: &Value) -> Result<bool> {
     let s = match v {
         Value::Bool(b) => return Ok(*b),
         Value::Null => return Ok(false),
         v => scalar(v, "when")?,
     };
+    if let Some(result) = compare(&s) {
+        return Ok(result);
+    }
     let s = s.trim();
     let (negate, s) = match s.strip_prefix('!') {
         Some(rest) => (true, rest.trim()),
@@ -502,6 +506,28 @@ fn truthy(v: &Value) -> Result<bool> {
         "" | "false" | "no" | "off" | "0"
     );
     Ok(on != negate)
+}
+
+/// `A == B` or `A != B`, if `s` is a comparison. The first operator wins, and
+/// each side is trimmed and may be quoted, so `${env} == "staging"` works.
+fn compare(s: &str) -> Option<bool> {
+    let (at, equal) = match (s.find("=="), s.find("!=")) {
+        (Some(eq), Some(ne)) if ne < eq => (ne, false),
+        (Some(eq), _) => (eq, true),
+        (None, Some(ne)) => (ne, false),
+        (None, None) => return None,
+    };
+    let unquote = |side: &str| {
+        let side = side.trim();
+        for q in ['"', '\''] {
+            if let Some(inner) = side.strip_prefix(q).and_then(|r| r.strip_suffix(q)) {
+                return inner.to_string();
+            }
+        }
+        side.to_string()
+    };
+    let same = unquote(&s[..at]) == unquote(&s[at + 2..]);
+    Some(same == equal)
 }
 
 /// Take `key` out of a mapping value, if it's a mapping that has it.
@@ -1246,6 +1272,37 @@ windows:
             .collect();
         assert_eq!(dev, ["serve", "echo no logs"]);
         assert!(matches!(p.windows[3].layout, Node::Split { .. }));
+    }
+
+    #[test]
+    fn when_compares_values() {
+        let on = |s: &str| truthy(&Value::String(s.into())).unwrap();
+        assert!(on("staging == staging"));
+        assert!(on("staging == \"staging\""));
+        assert!(on("dev != prod"));
+        assert!(!on("dev == prod"));
+        assert!(!on("prod != prod"));
+        assert!(on(" == ''"));
+        // The first operator decides: this compares `a` with `b == c`.
+        assert!(on("a != b == c"));
+
+        let src = r#"
+vars: {env: dev}
+windows:
+  - always: x
+  - prod: { when: '${env} == prod', type: careful }
+  - not-prod:
+      when: ${env} != prod
+      panes: [y]
+"#;
+        assert_eq!(
+            window_names(&pv(src, &[], None).unwrap()),
+            ["always", "not-prod"]
+        );
+        assert_eq!(
+            window_names(&pv(src, &[("env", "prod")], None).unwrap()),
+            ["always", "prod"]
+        );
     }
 
     #[test]

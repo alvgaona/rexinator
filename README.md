@@ -155,7 +155,9 @@ side. To name sessions yourself, use `${layout}` in `name`, or set `name` in the
 ### Switching windows and panes on and off
 
 `when:` on a window or a pane includes it only when its value is on. `false`, `no`, `off`, `0`
-and an empty value are off; anything else is on, and a leading `!` flips it:
+and an empty value are off; anything else is on, and a leading `!` flips it. `A == B` and
+`A != B` compare text instead, after variables are filled in; quotes around either side are
+optional:
 
 ```yaml
 vars:
@@ -166,6 +168,9 @@ windows:
       panes:
         - npm run dev
         - { when: '!${with_db}', type: echo "no database" }
+  - deploy:
+      when: ${env} == prod                         # rexinator start env=prod
+      panes: [./deploy.sh --dry-run]
 ```
 
 When one side of a split is switched off, the other side fills the space. If `startup_window`
