@@ -1,9 +1,9 @@
 //! Preset layouts, and turning a project into a Rex `session.create` request.
 
 use anyhow::{Result, bail};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
-use crate::project::{Direction, Node, Project, Window};
+use crate::model::{Direction, Node, Pane, Project, Window};
 
 const TERMINAL: &str = "com.superlogical.terminal.shell";
 
@@ -16,52 +16,24 @@ pub const PRESETS: &[&str] = &[
 ];
 
 /// Build a split tree from a preset name, such as `main-left` or `main-left 70`.
-pub fn preset(spec: &str, mut panes: Vec<Node>) -> Result<Node> {
-    let mut words = spec.split_whitespace();
-    let name = words.next().unwrap_or("");
-    let main_pct = match words.next() {
-        None => None,
-        Some(w) => match w.trim_end_matches('%').parse::<f64>() {
-            Ok(n) if n > 0.0 && n < 100.0 => Some(n / 100.0),
-            _ => bail!("layout `{spec}`: the size must be a percentage between 1 and 99"),
-        },
+/// `panes` must not be empty.
+pub fn preset(spec: &str, panes: Vec<Node>) -> Result<Node> {
+    let words: Vec<&str> = spec.split_whitespace().collect();
+    let (name, size) = match words.as_slice() {
+        [] => ("", None),
+        [name] => (*name, None),
+        [name, size] => (*name, Some(main_size(spec, size)?)),
+        _ => bail!("layout `{spec}` has too many words"),
     };
-    if words.next().is_some() {
-        bail!("layout `{spec}` has too many words");
-    }
-    if main_pct.is_some() && !name.starts_with("main-") {
+    if size.is_some() && !name.starts_with("main-") {
         bail!("layout `{name}` doesn't take a size; only main-left and main-top do");
     }
     Ok(match name {
         "even-horizontal" => even(panes, Direction::Horizontal),
         "even-vertical" => even(panes, Direction::Vertical),
-        "main-left" | "main-top" => {
-            let (dir, rest_dir) = if name == "main-left" {
-                (Direction::Horizontal, Direction::Vertical)
-            } else {
-                (Direction::Vertical, Direction::Horizontal)
-            };
-            let main = panes.remove(0);
-            if panes.is_empty() {
-                main
-            } else {
-                Node::Split {
-                    direction: dir,
-                    ratio: main_pct.unwrap_or(0.6),
-                    before: Box::new(main),
-                    after: Box::new(even(panes, rest_dir)),
-                }
-            }
-        }
-        "tiled" => {
-            let cols = (panes.len() as f64).sqrt().ceil() as usize;
-            let mut rows = Vec::new();
-            while !panes.is_empty() {
-                let row: Vec<Node> = panes.drain(..cols.min(panes.len())).collect();
-                rows.push(even(row, Direction::Horizontal));
-            }
-            even(rows, Direction::Vertical)
-        }
+        "main-left" => main(panes, Direction::Horizontal, size.unwrap_or(0.6)),
+        "main-top" => main(panes, Direction::Vertical, size.unwrap_or(0.6)),
+        "tiled" => tiled(panes),
         other => bail!(
             "unknown layout `{other}` (expected one of: {})",
             PRESETS.join(", ")
@@ -69,18 +41,58 @@ pub fn preset(spec: &str, mut panes: Vec<Node>) -> Result<Node> {
     })
 }
 
-/// Equal-sized panes in a row or column.
-fn even(mut nodes: Vec<Node>, direction: Direction) -> Node {
-    let n = nodes.len();
-    let first = nodes.remove(0);
-    if n == 1 {
-        return first;
+/// The main pane's share, from a percentage such as `70` or `70%`.
+fn main_size(spec: &str, word: &str) -> Result<f64> {
+    match word.trim_end_matches('%').parse::<f64>() {
+        Ok(n) if n > 0.0 && n < 100.0 => Ok(n / 100.0),
+        _ => bail!("layout `{spec}`: the size must be a percentage between 1 and 99"),
     }
-    Node::Split {
-        direction,
-        ratio: 1.0 / n as f64,
-        before: Box::new(first),
-        after: Box::new(even(nodes, direction)),
+}
+
+/// The first pane takes `ratio` of the space; the rest share what's left,
+/// laid out across the other direction.
+fn main(panes: Vec<Node>, direction: Direction, ratio: f64) -> Node {
+    let mut rest = panes.into_iter();
+    let first = rest.next().expect("a layout has at least one pane");
+    let rest: Vec<Node> = rest.collect();
+    if rest.is_empty() {
+        first
+    } else {
+        Node::split(direction, ratio, first, even(rest, direction.other()))
+    }
+}
+
+/// Rows of equal panes, as close to a square grid as the count allows.
+fn tiled(panes: Vec<Node>) -> Node {
+    let cols = (panes.len() as f64).sqrt().ceil() as usize;
+    let rows = panes
+        .chunks(cols)
+        .map(|row| even(row.to_vec(), Direction::Horizontal))
+        .collect();
+    even(rows, Direction::Vertical)
+}
+
+/// Equal-sized panes in a row or column. Built from the end: a pane in front
+/// of `count` others gets 1/(count + 1) of the space.
+fn even(nodes: Vec<Node>, direction: Direction) -> Node {
+    nodes
+        .into_iter()
+        .rev()
+        .map(|node| (node, 1))
+        .reduce(|(after, count), (before, _)| {
+            let ratio = 1.0 / (count + 1) as f64;
+            (Node::split(direction, ratio, before, after), count + 1)
+        })
+        .map(|(node, _)| node)
+        .expect("a layout has at least one pane")
+}
+
+impl Direction {
+    fn other(self) -> Direction {
+        match self {
+            Direction::Horizontal => Direction::Vertical,
+            Direction::Vertical => Direction::Horizontal,
+        }
     }
 }
 
@@ -99,24 +111,7 @@ pub fn window_request(w: &Window) -> Value {
 
 fn node_json(node: &Node) -> Value {
     match node {
-        Node::Pane(p) => {
-            let mut options = json!({ "cwd": p.cwd });
-            if !p.typed.is_empty() {
-                options["initial_input"] =
-                    json!(p.typed.iter().map(|c| format!("{c}\n")).collect::<String>());
-            }
-            if let Some(cmd) = &p.run {
-                options["command"] = json!(cmd);
-            }
-            if p.keep_open {
-                options["exit"] = json!({ "on_completion": false });
-            }
-            let mut block = json!({ "flavor": TERMINAL, "options": options });
-            if let Some(label) = &p.label {
-                block["label"] = json!(label);
-            }
-            json!({ "block": block })
-        }
+        Node::Pane(p) => json!({ "block": block_json(p) }),
         Node::Split {
             direction,
             ratio,
@@ -136,10 +131,37 @@ fn node_json(node: &Node) -> Value {
     }
 }
 
+/// A terminal block: only the options a pane sets are included.
+fn block_json(p: &Pane) -> Value {
+    let options: Map<String, Value> = [
+        Some(("cwd", json!(p.cwd))),
+        (!p.typed.is_empty()).then(|| {
+            let input: String = p.typed.iter().map(|c| format!("{c}\n")).collect();
+            ("initial_input", json!(input))
+        }),
+        p.run.as_ref().map(|cmd| ("command", json!(cmd))),
+        p.keep_open
+            .then(|| ("exit", json!({ "on_completion": false }))),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    let block: Map<String, Value> = [
+        Some(("flavor", json!(TERMINAL))),
+        Some(("options", Value::Object(options))),
+        p.label.as_ref().map(|l| ("label", json!(l))),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    Value::Object(block)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project::Pane;
 
     fn panes(n: usize) -> Vec<Node> {
         (0..n)

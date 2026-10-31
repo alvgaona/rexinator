@@ -1,112 +1,118 @@
-//! Reading project files: variables, layouts, windows, panes and split trees.
+//! Turning project files into a [`Project`]: layouts, variables, windows,
+//! panes and split trees. Everything here is pure except [`load`], which
+//! reads files through the [`Fs`] it's given.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use serde_yaml::{Mapping, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::env::{self, Env};
+use crate::fs::Fs;
 use crate::layout;
+use crate::model::{Direction, Hooks, Node, Pane, Project, Window};
+use crate::vars::{self, Lookup};
+use crate::when::truthy;
+use crate::yaml::{self, check_keys, commands, scalar};
 
 /// File names for a project file kept inside a project's own folder.
 pub const LOCAL_NAMES: &[&str] = &[".rexinator.yml", ".rexinator.yaml"];
 /// A folder in a project that holds several project files.
 pub const LOCAL_DIR: &str = ".rexinator";
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Project {
-    /// Session label. Also how `start` finds a session that's already running.
-    pub name: String,
-    pub root: PathBuf,
-    /// The Rex server to use, as `rex -S` takes it. None means the local one.
-    pub server: Option<String>,
-    /// Runs on every `start`, before anything else.
-    pub on_start: Vec<String>,
-    /// Runs only when the session is created.
-    pub on_first_start: Vec<String>,
-    /// Runs only when the session was already running.
-    pub on_restart: Vec<String>,
-    pub on_stop: Vec<String>,
-    pub windows: Vec<Window>,
-    /// Index of the window to show first.
-    pub startup_window: usize,
-    /// Index of the pane to focus in the startup window, in layout order.
-    pub startup_pane: Option<usize>,
-    /// The layout used, if the file has `layouts`.
-    pub layout: Option<String>,
-    /// Every layout the file offers, in order.
-    pub layouts: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Window {
-    pub name: String,
-    pub layout: Node,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Node {
-    Pane(Pane),
-    Split {
-        direction: Direction,
-        /// Share of the space that `before` gets, between 0 and 1.
-        ratio: f64,
-        before: Box<Node>,
-        after: Box<Node>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    /// Side by side: `before` on the left.
-    Horizontal,
-    /// Stacked: `before` on top.
-    Vertical,
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Pane {
-    pub cwd: PathBuf,
-    pub label: Option<String>,
-    /// Commands typed into the pane's shell, one per line.
-    pub typed: Vec<String>,
-    /// A program to run as the pane itself, instead of a shell.
-    pub run: Option<Vec<String>>,
-    pub keep_open: bool,
-}
-
-impl Node {
-    /// Panes in layout order: each split's `before` side first. Rex returns
-    /// block IDs in the same order.
-    pub fn panes(&self) -> Vec<&Pane> {
-        match self {
-            Node::Pane(p) => vec![p],
-            Node::Split { before, after, .. } => {
-                let mut v = before.panes();
-                v.extend(after.panes());
-                v
-            }
-        }
-    }
-
-    fn panes_mut(&mut self) -> Vec<&mut Pane> {
-        match self {
-            Node::Pane(p) => vec![p],
-            Node::Split { before, after, .. } => {
-                let mut v = before.panes_mut();
-                v.extend(after.panes_mut());
-                v
-            }
-        }
-    }
-}
+const PROJECT_KEYS: &[&str] = &[
+    "name",
+    "root",
+    "server",
+    "pre_window",
+    "on_start",
+    "on_first_start",
+    "on_restart",
+    "on_stop",
+    "startup_window",
+    "startup_pane",
+    "windows",
+];
 
 /// Values used when a project file leaves something out.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Defaults {
     pub name: String,
     pub root: PathBuf,
     /// Relative `root` paths are resolved against this.
     pub base: PathBuf,
 }
+
+/// What building a project needs from outside its files.
+pub struct Context<'a> {
+    /// What `~` stands for.
+    pub home: &'a Path,
+    /// Environment variables, the last place `${NAME}` is looked up.
+    pub env: &'a Lookup<'a>,
+}
+
+/// What the command line asks of a project file.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Request {
+    /// KEY=VALUE pairs.
+    pub vars: HashMap<String, String>,
+    /// `@LAYOUT`.
+    pub layout: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Reading files: the only part that touches the file system, through `fs`.
+
+/// Load a project file, the files it `extends`, and its `.local` overrides file.
+pub fn load(fs: &Fs, env: &Env, path: &Path, request: &Request) -> Result<Project> {
+    let path = env::absolute(&env.cwd, path);
+    let doc = read_doc(fs, &env.home, &path, 0)?;
+    let overlay_file = overlay_path(&path);
+    let overlay = (fs.is_file)(&overlay_file)
+        .then(|| read_yaml(fs, &overlay_file))
+        .transpose()?;
+    let lookup = |name: &str| env.vars.get(name).cloned();
+    let cx = Context {
+        home: &env.home,
+        env: &lookup,
+    };
+    build(doc, overlay, request, &defaults_for(&path, &env.cwd), &cx)
+        .with_context(|| format!("in {}", path.display()))
+}
+
+fn read_yaml(fs: &Fs, path: &Path) -> Result<Value> {
+    let text = (fs.read)(path).with_context(|| format!("can't read {}", path.display()))?;
+    serde_yaml::from_str(&text).with_context(|| format!("in {}", path.display()))
+}
+
+/// Read a project file, applied on top of the file it `extends`.
+fn read_doc(fs: &Fs, home: &Path, path: &Path, depth: usize) -> Result<Mapping> {
+    if depth > 10 {
+        bail!("`extends` goes more than 10 files deep; is there a loop?");
+    }
+    let doc = yaml::mapping(read_yaml(fs, path)?, "a project file")
+        .with_context(|| format!("in {}", path.display()))?;
+    let (doc, parent) = yaml::split(&doc, "extends");
+    let Some(parent) = parent else {
+        return Ok(doc);
+    };
+    let parent = extends_path(home, path, &scalar(&parent, "extends")?);
+    let base = read_doc(fs, home, &parent, depth + 1)
+        .with_context(|| format!("in the file {} extends", path.display()))?;
+    Ok(yaml::merge(&base, &doc))
+}
+
+/// `extends: NAME` is relative to the file, and `.yml` is optional.
+fn extends_path(home: &Path, file: &Path, name: &str) -> PathBuf {
+    let path = join(home, file.parent().unwrap_or(Path::new("/")), name);
+    match path.extension() {
+        Some(_) => path,
+        None => path.with_extension("yml"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Where a project file is, and what that implies.
 
 /// The project folder a project file belongs to: the folder holding a
 /// `.rexinator.yml`, or the folder above a `.rexinator/` folder. None for a
@@ -123,340 +129,293 @@ pub fn project_dir_of(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Default name and folders for a project file.
-pub fn defaults_for(path: &Path) -> Result<Defaults> {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("project")
-        .to_string();
-    Ok(match project_dir_of(path) {
-        // A project file in a project's folder belongs to that folder: it
-        // names the session after it and starts panes in it.
+/// Default name and folders for a project file. A file in a project's
+/// folder names the session after that folder and starts panes in it; one
+/// in the config folder uses its own name and the current folder.
+pub fn defaults_for(path: &Path, cwd: &Path) -> Defaults {
+    let stem = file_stem(path).unwrap_or("project").to_string();
+    match project_dir_of(path) {
         Some(dir) => {
             let folder = dir
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("project")
-                .to_string();
-            let name = if LOCAL_NAMES.iter().any(|n| path.ends_with(n)) || stem == "default" {
-                folder
-            } else {
-                format!("{folder}-{stem}")
-            };
+                .unwrap_or("project");
+            let is_main = LOCAL_NAMES.iter().any(|n| path.ends_with(n)) || stem == "default";
             Defaults {
-                name,
+                name: if is_main {
+                    folder.to_string()
+                } else {
+                    format!("{folder}-{stem}")
+                },
                 root: dir.clone(),
                 base: dir,
             }
         }
         None => Defaults {
             name: stem,
-            root: std::env::current_dir()?,
+            root: cwd.to_path_buf(),
             base: path
                 .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("/")),
+                .map_or_else(|| PathBuf::from("/"), Path::to_path_buf),
         },
-    })
+    }
 }
 
 /// The personal overrides file next to a project file:
 /// `.rexinator.local.yml` for `.rexinator.yml`, `shop.local.yml` for `shop.yml`.
 pub fn overlay_path(path: &Path) -> PathBuf {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let stem = file_stem(path).unwrap_or("");
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("yml");
     path.with_file_name(format!("{stem}.local.{ext}"))
 }
 
-/// Load a project file, the files it `extends`, and its `.local` overrides
-/// file. `overrides` are the KEY=VALUE pairs from the command line, and
-/// `layout` is the layout asked for, if any.
-pub fn load(
-    path: &Path,
-    overrides: &HashMap<String, String>,
-    layout: Option<&str>,
-) -> Result<Project> {
-    let path = std::path::absolute(path)?;
-    let defaults = defaults_for(&path)?;
-    let doc = read_doc(&path, 0)?;
-
-    let overlay_file = overlay_path(&path);
-    let overlay = if overlay_file.is_file() {
-        let text = std::fs::read_to_string(&overlay_file)?;
-        Some(
-            serde_yaml::from_str(&text)
-                .with_context(|| format!("in {}", overlay_file.display()))?,
-        )
-    } else {
-        None
-    };
-
-    build(doc, overlay, overrides, &defaults, layout)
-        .with_context(|| format!("in {}", path.display()))
+fn file_stem(path: &Path) -> Option<&str> {
+    path.file_stem().and_then(|s| s.to_str())
 }
 
-/// Read a project file, applying it on top of the file it `extends`.
-fn read_doc(path: &Path, depth: usize) -> Result<Mapping> {
-    if depth > 10 {
-        bail!("`extends` goes more than 10 files deep; is there a loop?");
-    }
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("can't read {}", path.display()))?;
-    let mut doc =
-        to_mapping(serde_yaml::from_str(&text).with_context(|| format!("in {}", path.display()))?)
-            .with_context(|| format!("in {}", path.display()))?;
-    let Some(parent) = doc.remove("extends") else {
-        return Ok(doc);
-    };
+// ---------------------------------------------------------------------------
+// Building a project from its documents.
 
-    let parent = scalar(&parent, "extends")?;
-    let dir = path.parent().unwrap_or(Path::new("/"));
-    let mut parent_path = join(dir, &parent);
-    if parent_path.extension().is_none() {
-        parent_path.set_extension("yml");
-    }
-    let mut base = read_doc(&parent_path, depth + 1)
-        .with_context(|| format!("in the file {} extends", path.display()))?;
-    merge(&mut base, doc);
-    Ok(base)
-}
-
-fn to_mapping(v: Value) -> Result<Mapping> {
-    match v {
-        Value::Mapping(m) => Ok(m),
-        _ => bail!("a project file must be a mapping with `windows` or `layouts`"),
-    }
-}
-
-/// Parse project YAML, with optional overrides from a `.local` file.
-#[cfg(test)]
-pub fn parse(
-    text: &str,
+/// A project from its file (with `extends` already applied) and an optional
+/// `.local` overrides file.
+pub fn build(
+    doc: Mapping,
     overlay: Option<Value>,
-    overrides: &HashMap<String, String>,
+    request: &Request,
     defaults: &Defaults,
-    layout: Option<&str>,
+    cx: &Context,
 ) -> Result<Project> {
-    build(
-        to_mapping(serde_yaml::from_str(text)?)?,
-        overlay,
-        overrides,
-        defaults,
-        layout,
-    )
-}
-
-fn build(
-    mut doc: Mapping,
-    overlay: Option<Value>,
-    overrides: &HashMap<String, String>,
-    defaults: &Defaults,
-    layout: Option<&str>,
-) -> Result<Project> {
-    let mut overlay = overlay
-        .map(|o| to_mapping(o).context("a .local file must be a mapping, like the project file"))
-        .transpose()?;
-
-    // Pick the layout. A .local file can add layouts or change the default.
-    let mut layouts = take_mapping(&mut doc, "layouts")?;
-    let mut default = doc.remove("default");
-    if let Some(ov) = &mut overlay {
-        if let Some(extra) = take_mapping(ov, "layouts")? {
-            let all = layouts.get_or_insert_with(Mapping::new);
-            for (k, v) in extra {
-                all.insert(k, v);
-            }
-        }
-        if let Some(d) = ov.remove("default") {
-            default = Some(d);
-        }
-    }
-    let mut layout_names_session = false;
-    let (chosen, names, is_default) = match layouts {
-        None => {
-            if let Some(l) = layout {
-                bail!("there's no layout `{l}`: this project has no `layouts`");
-            }
-            if default.is_some() {
-                bail!("`default` names a layout, but this project has no `layouts`");
-            }
-            (None, vec![], true)
-        }
-        Some(all) => {
-            if doc.contains_key("windows") {
-                bail!("use either `windows` or `layouts`, not both");
-            }
-            let names = all
-                .keys()
-                .map(|k| scalar(k, "layout name"))
-                .collect::<Result<Vec<_>>>()?;
-            let Some(first) = names.first() else {
-                bail!("`layouts` is empty")
-            };
-            let default = match default {
-                Some(d) => scalar(&d, "default")?,
-                None => first.clone(),
-            };
-            if !names.contains(&default) {
-                bail!(
-                    "`default` is `{default}`, but there's no such layout (there are: {})",
-                    names.join(", ")
-                );
-            }
-            let want = layout.map(String::from).unwrap_or_else(|| default.clone());
-            let body = all.get(want.as_str()).ok_or_else(|| {
-                anyhow!(
-                    "there's no layout `{want}` (this project has: {})",
-                    names.join(", ")
-                )
-            })?;
-            let body = to_mapping(body.clone())
-                .with_context(|| format!("layout `{want}` must be a mapping"))?;
-            if body.contains_key("layouts") || body.contains_key("default") {
-                bail!("layout `{want}` can't contain `layouts` or `default`");
-            }
-            layout_names_session = body.contains_key("name");
-            merge(&mut doc, body);
-            let is_default = want == default;
-            (Some(want), names, is_default)
-        }
-    };
-    if let Some(ov) = overlay {
-        merge(&mut doc, ov);
-    }
+    let overlay = overlay
+        .map(|o| yaml::mapping(o, "a .local file, like the project file,"))
+        .transpose()?
+        .unwrap_or_default();
+    let chosen = choose_layout(&doc, &overlay, request.layout.as_deref())?;
+    let (overlay, _) = yaml::split(&overlay, "layouts");
+    let (overlay, _) = yaml::split(&overlay, "default");
+    let doc = yaml::merge(&chosen.doc, &overlay);
     let raw_name = doc.get("name").and_then(Value::as_str).map(String::from);
 
-    // `${layout}` is the chosen layout's name.
-    let mut overrides = overrides.clone();
-    if let Some(l) = &chosen {
-        overrides
-            .entry("layout".into())
-            .or_insert_with(|| l.clone());
-    }
-    let overrides = &overrides;
-
-    let vars = resolve_vars(doc.remove("vars").as_ref(), overrides)?;
-    let lookup = |name: &str| -> Option<String> {
+    // `${layout}` is the chosen layout's name, unless the command line sets it.
+    let overrides: HashMap<String, String> = chosen
+        .layout
+        .iter()
+        .map(|l| ("layout".to_string(), l.clone()))
+        .chain(request.vars.clone())
+        .collect();
+    let (doc, var_defs) = yaml::split(&doc, "vars");
+    let vars = vars::resolve(var_defs.as_ref(), &overrides, cx.env)?;
+    let lookup = |name: &str| {
         overrides
             .get(name)
             .or_else(|| vars.get(name))
             .cloned()
-            .or_else(|| std::env::var(name).ok())
+            .or_else(|| (cx.env)(name))
     };
-    let doc = to_mapping(subst_value(Value::Mapping(doc), &lookup)?)?;
-
-    check_keys(
-        &doc,
-        &[
-            "name",
-            "root",
-            "server",
-            "pre_window",
-            "on_start",
-            "on_first_start",
-            "on_restart",
-            "on_stop",
-            "startup_window",
-            "startup_pane",
-            "windows",
-        ],
-        "the project",
+    let doc = yaml::mapping(
+        vars::substitute_value(Value::Mapping(doc), &lookup)?,
+        "a project file",
     )?;
+    check_keys(&doc, PROJECT_KEYS, "the project")?;
 
-    let mut name = match doc.get("name") {
-        Some(v) => scalar(v, "name")?,
-        None => defaults.name.clone(),
-    };
-    // Another layout gets its own session, unless the name already says which.
-    if let Some(l) = &chosen
-        && !is_default
-        && !layout_names_session
-        && !raw_name.is_some_and(|n| n.contains("${layout"))
-    {
-        name = format!("{name}-{l}");
-    }
     let root = match doc.get("root") {
-        Some(v) => join(&defaults.base, &scalar(v, "root")?),
+        Some(v) => join(cx.home, &defaults.base, &scalar(v, "root")?),
         None => defaults.root.clone(),
     };
     let pre_window = commands(doc.get("pre_window"), "pre_window")?;
-
-    let mut hidden = Vec::new();
-    let mut windows = Vec::new();
-    match doc.get("windows") {
-        Some(Value::Sequence(items)) if !items.is_empty() => {
-            for (i, item) in items.iter().enumerate() {
-                match parse_window(item, i, &root, &pre_window)? {
-                    Ok(w) => windows.push(w),
-                    Err(hidden_name) => hidden.push(hidden_name),
-                }
-            }
-        }
-        Some(_) => bail!("`windows` must be a non-empty list"),
-        None => bail!("the project has no `windows`"),
-    }
-    if windows.is_empty() {
-        bail!("every window is switched off by `when`");
-    }
-
-    let startup_window = match doc.get("startup_window") {
-        None => 0,
-        Some(v) => {
-            let want = scalar(v, "startup_window")?;
-            match windows.iter().position(|w| w.name == want) {
-                Some(i) => i,
-                // Switched off by `when`: show the first window instead.
-                None if hidden.contains(&want) => 0,
-                None => number(&want, windows.len(), "startup_window", || {
-                    "doesn't match any window name".to_string()
-                })?,
-            }
-        }
-    };
-
-    let startup_pane = match doc.get("startup_pane") {
-        None => None,
-        Some(v) => {
-            let want = scalar(v, "startup_pane")?;
-            let window = &windows[startup_window];
-            let panes = window.layout.panes();
-            Some(
-                match panes
-                    .iter()
-                    .position(|p| p.label.as_deref() == Some(want.as_str()))
-                {
-                    Some(i) => i,
-                    None => number(&want, panes.len(), "startup_pane", || {
-                        format!("doesn't match a pane label in window `{}`", window.name)
-                    })?,
-                },
-            )
-        }
-    };
+    let (windows, hidden) = windows(doc.get("windows"), &root, &pre_window, cx.home)?;
+    let startup_window = startup_window(doc.get("startup_window"), &windows, &hidden)?;
+    let startup_pane = startup_pane(doc.get("startup_pane"), &windows[startup_window])?;
 
     Ok(Project {
-        name,
+        name: session_name(&doc, defaults, &chosen, raw_name.as_deref())?,
         root,
         server: doc.get("server").map(|v| scalar(v, "server")).transpose()?,
-        on_start: commands(doc.get("on_start"), "on_start")?,
-        on_first_start: commands(doc.get("on_first_start"), "on_first_start")?,
-        on_restart: commands(doc.get("on_restart"), "on_restart")?,
-        on_stop: commands(doc.get("on_stop"), "on_stop")?,
+        hooks: Hooks {
+            on_start: commands(doc.get("on_start"), "on_start")?,
+            on_first_start: commands(doc.get("on_first_start"), "on_first_start")?,
+            on_restart: commands(doc.get("on_restart"), "on_restart")?,
+            on_stop: commands(doc.get("on_stop"), "on_stop")?,
+        },
         windows,
         startup_window,
         startup_pane,
-        layout: chosen,
-        layouts: names,
+        layout: chosen.layout,
+        layouts: chosen.names,
     })
 }
 
-fn take_mapping(m: &mut Mapping, key: &str) -> Result<Option<Mapping>> {
-    match m.remove(key) {
-        None => Ok(None),
-        Some(Value::Mapping(v)) => Ok(Some(v)),
-        Some(_) => bail!("`{key}` must be a mapping"),
+/// The project document with the chosen layout applied.
+struct Chosen {
+    doc: Mapping,
+    layout: Option<String>,
+    /// Every layout name, in order.
+    names: Vec<String>,
+    is_default: bool,
+    /// The layout sets `name` itself.
+    names_session: bool,
+}
+
+/// Apply the layout asked for, or the default one. A `.local` file can add
+/// layouts or change the default.
+fn choose_layout(doc: &Mapping, overlay: &Mapping, want: Option<&str>) -> Result<Chosen> {
+    let (doc, layouts) = yaml::split(doc, "layouts");
+    let (doc, default) = yaml::split(&doc, "default");
+    let default = overlay.get("default").cloned().or(default);
+    let layouts = match (layouts, overlay.get("layouts").cloned()) {
+        (None, None) => None,
+        (base, extra) => Some(yaml::overlay(
+            &yaml::optional_mapping(base, "`layouts`")?,
+            &yaml::optional_mapping(extra, "`layouts`")?,
+        )),
+    };
+
+    let Some(all) = layouts else {
+        if let Some(l) = want {
+            bail!("there's no layout `{l}`: this project has no `layouts`");
+        }
+        if default.is_some() {
+            bail!("`default` names a layout, but this project has no `layouts`");
+        }
+        return Ok(Chosen {
+            doc,
+            layout: None,
+            names: vec![],
+            is_default: true,
+            names_session: false,
+        });
+    };
+
+    if doc.contains_key("windows") {
+        bail!("use either `windows` or `layouts`, not both");
     }
+    let names = all
+        .keys()
+        .map(|k| scalar(k, "layout name"))
+        .collect::<Result<Vec<_>>>()?;
+    let default = match (default, names.first()) {
+        (Some(d), _) => scalar(&d, "default")?,
+        (None, Some(first)) => first.clone(),
+        (None, None) => bail!("`layouts` is empty"),
+    };
+    if !names.contains(&default) {
+        bail!(
+            "`default` is `{default}`, but there's no such layout (there are: {})",
+            names.join(", ")
+        );
+    }
+    let want = want.map_or_else(|| default.clone(), String::from);
+    let body = all.get(want.as_str()).cloned().ok_or_else(|| {
+        anyhow!(
+            "there's no layout `{want}` (this project has: {})",
+            names.join(", ")
+        )
+    })?;
+    let body = yaml::mapping(body, &format!("layout `{want}`"))?;
+    if body.contains_key("layouts") || body.contains_key("default") {
+        bail!("layout `{want}` can't contain `layouts` or `default`");
+    }
+    Ok(Chosen {
+        doc: yaml::merge(&doc, &body),
+        is_default: want == default,
+        names_session: body.contains_key("name"),
+        layout: Some(want),
+        names,
+    })
+}
+
+/// The session label. A layout other than the default gets its own session,
+/// unless the name already says which layout it is.
+fn session_name(
+    doc: &Mapping,
+    defaults: &Defaults,
+    chosen: &Chosen,
+    raw_name: Option<&str>,
+) -> Result<String> {
+    let name = match doc.get("name") {
+        Some(v) => scalar(v, "name")?,
+        None => defaults.name.clone(),
+    };
+    let names_layout = chosen.names_session || raw_name.is_some_and(|n| n.contains("${layout"));
+    Ok(match &chosen.layout {
+        Some(l) if !chosen.is_default && !names_layout => format!("{name}-{l}"),
+        _ => name,
+    })
+}
+
+/// A window, or the name of one that `when` switched off.
+enum Parsed {
+    On(Window),
+    Off(String),
+}
+
+/// The windows that are on, and the names of those switched off.
+fn windows(
+    v: Option<&Value>,
+    root: &Path,
+    pre_window: &[String],
+    home: &Path,
+) -> Result<(Vec<Window>, Vec<String>)> {
+    let items = match v {
+        Some(Value::Sequence(items)) if !items.is_empty() => items,
+        Some(_) => bail!("`windows` must be a non-empty list"),
+        None => bail!("the project has no `windows`"),
+    };
+    let parsed = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| parse_window(item, i, root, pre_window, home))
+        .collect::<Result<Vec<_>>>()?;
+    let on: Vec<Window> = parsed
+        .iter()
+        .filter_map(|p| match p {
+            Parsed::On(w) => Some(w.clone()),
+            Parsed::Off(_) => None,
+        })
+        .collect();
+    let off: Vec<String> = parsed
+        .into_iter()
+        .filter_map(|p| match p {
+            Parsed::Off(name) => Some(name),
+            Parsed::On(_) => None,
+        })
+        .collect();
+    if on.is_empty() {
+        bail!("every window is switched off by `when`");
+    }
+    Ok((on, off))
+}
+
+/// The window to show first, by name or number. One that `when` switched off
+/// falls back to the first window.
+fn startup_window(v: Option<&Value>, windows: &[Window], hidden: &[String]) -> Result<usize> {
+    let Some(v) = v else { return Ok(0) };
+    let want = scalar(v, "startup_window")?;
+    match windows.iter().position(|w| w.name == want) {
+        Some(i) => Ok(i),
+        None if hidden.contains(&want) => Ok(0),
+        None => number(&want, windows.len(), "startup_window", || {
+            "doesn't match any window name".to_string()
+        }),
+    }
+}
+
+/// The pane to focus in the startup window, by label or number.
+fn startup_pane(v: Option<&Value>, window: &Window) -> Result<Option<usize>> {
+    let Some(v) = v else { return Ok(None) };
+    let want = scalar(v, "startup_pane")?;
+    let panes = window.layout.panes();
+    panes
+        .iter()
+        .position(|p| p.label.as_deref() == Some(want.as_str()))
+        .map_or_else(
+            || {
+                number(&want, panes.len(), "startup_pane", || {
+                    format!("doesn't match a pane label in window `{}`", window.name)
+                })
+            },
+            Ok,
+        )
+        .map(Some)
 }
 
 /// A 1-based position, as an index.
@@ -468,231 +427,163 @@ fn number(want: &str, len: usize, what: &str, no_match: impl Fn() -> String) -> 
     }
 }
 
-/// Apply `top` over `base`: its keys replace the base's, except `vars` and
-/// `layouts`, which are merged one entry at a time.
-fn merge(base: &mut Mapping, top: Mapping) {
-    for (k, v) in top {
-        if let Some(key @ ("vars" | "layouts")) = k.as_str()
-            && let (Some(Value::Mapping(into)), Value::Mapping(extra)) = (base.get_mut(key), &v)
-        {
-            for (ek, ev) in extra {
-                into.insert(ek.clone(), ev.clone());
-            }
-            continue;
-        }
-        base.insert(k, v);
-    }
-}
-
-/// Whether a `when` value switches something on. `||` and `&&` combine
-/// terms, with `&&` binding tighter. Each term is a comparison (`A == B`,
-/// `A != B`) or a value, which is off for false, no, off, 0 and empty; a
-/// leading `!` flips a value.
-fn truthy(v: &Value) -> Result<bool> {
-    let s = match v {
-        Value::Bool(b) => return Ok(*b),
-        Value::Null => return Ok(false),
-        v => scalar(v, "when")?,
-    };
-    Ok(s.split("||").any(|any| any.split("&&").all(term_on)))
-}
-
-/// One term of a `when` value: a comparison, or a value with an optional `!`.
-fn term_on(term: &str) -> bool {
-    if let Some(result) = compare(term) {
-        return result;
-    }
-    let term = term.trim();
-    let (negate, term) = match term.strip_prefix('!') {
-        Some(rest) => (true, rest.trim()),
-        None => (false, term),
-    };
-    let on = !matches!(
-        term.to_ascii_lowercase().as_str(),
-        "" | "false" | "no" | "off" | "0"
-    );
-    on != negate
-}
-
-/// `A == B` or `A != B`, if `s` is a comparison. The first operator wins, and
-/// each side is trimmed and may be quoted, so `${env} == "staging"` works.
-fn compare(s: &str) -> Option<bool> {
-    let (at, equal) = match (s.find("=="), s.find("!=")) {
-        (Some(eq), Some(ne)) if ne < eq => (ne, false),
-        (Some(eq), _) => (eq, true),
-        (None, Some(ne)) => (ne, false),
-        (None, None) => return None,
-    };
-    let unquote = |side: &str| {
-        let side = side.trim();
-        for q in ['"', '\''] {
-            if let Some(inner) = side.strip_prefix(q).and_then(|r| r.strip_suffix(q)) {
-                return inner.to_string();
-            }
-        }
-        side.to_string()
-    };
-    let same = unquote(&s[..at]) == unquote(&s[at + 2..]);
-    Some(same == equal)
-}
-
-/// Take `key` out of a mapping value, if it's a mapping that has it.
-fn take_key(v: &Value, key: &str) -> (Value, Option<Value>) {
-    match v {
-        Value::Mapping(m) if m.contains_key(key) => {
-            let mut m = m.clone();
-            let taken = m.remove(key);
-            (Value::Mapping(m), taken)
-        }
-        v => (v.clone(), None),
-    }
-}
-
-/// A window, or `Err(name)` if `when` switched it (or all its panes) off.
 fn parse_window(
     item: &Value,
     index: usize,
     root: &Path,
     pre_window: &[String],
-) -> Result<Result<Window, String>> {
-    let Some(m) = item.as_mapping().filter(|m| m.len() == 1) else {
+    home: &Path,
+) -> Result<Parsed> {
+    let Some((key, value)) = item
+        .as_mapping()
+        .filter(|m| m.len() == 1)
+        .and_then(|m| m.iter().next())
+    else {
         bail!(
             "window {} must be written as `- NAME: COMMAND` or `- NAME: {{ ... }}`",
             index + 1
         );
     };
-    let (key, value) = m.iter().next().unwrap();
     let name = scalar(key, "window name")?;
 
     // `pre` and `when` belong to the window, so take them out before reading the layout.
-    let (value, pre) = take_key(value, "pre");
-    let pre = commands(pre.as_ref(), "pre")?;
-    let (value, when) = take_key(&value, "when");
-    if let Some(w) = when
-        && !truthy(&w).with_context(|| format!("in window `{name}`"))?
-    {
-        return Ok(Err(name));
-    }
-
-    let Some(mut layout) =
-        parse_node(&value, root).with_context(|| format!("in window `{name}`"))?
-    else {
-        return Ok(Err(name));
+    let (value, pre) = yaml::split_value(value, "pre");
+    let (value, when) = yaml::split_value(&value, "when");
+    let on = match &when {
+        Some(w) => truthy(w).with_context(|| format!("in window `{name}`"))?,
+        None => true,
     };
-    let pre: Vec<String> = pre_window.iter().chain(&pre).cloned().collect();
-    if !pre.is_empty() {
-        for pane in layout.panes_mut() {
-            apply_pre(pane, &pre);
-        }
+    if !on {
+        return Ok(Parsed::Off(name));
     }
-    Ok(Ok(Window { name, layout }))
+    let pre: Vec<String> = pre_window
+        .iter()
+        .cloned()
+        .chain(commands(pre.as_ref(), "pre")?)
+        .collect();
+    Ok(
+        match parse_node(&value, root, home).with_context(|| format!("in window `{name}`"))? {
+            None => Parsed::Off(name),
+            Some(layout) if pre.is_empty() => Parsed::On(Window { name, layout }),
+            Some(layout) => Parsed::On(Window {
+                name,
+                layout: layout.map_panes(&|pane| with_pre(pane, &pre)),
+            }),
+        },
+    )
 }
 
-/// Run `pre` before the pane's own commands. A `run` pane has no shell to
-/// type into, so it's wrapped in one that runs `pre` and then the program.
-fn apply_pre(pane: &mut Pane, pre: &[String]) {
-    match pane.run.take() {
-        None => {
-            let mut typed = pre.to_vec();
-            typed.append(&mut pane.typed);
-            pane.typed = typed;
-        }
-        Some(argv) => {
-            let mut cmd = vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!("{}\nexec \"$@\"", pre.join("\n")),
-                "sh".to_string(),
-            ];
-            cmd.extend(argv);
-            pane.run = Some(cmd);
-        }
+/// The pane with `pre` run before its own commands. A `run` pane has no
+/// shell to type into, so it's wrapped in one that runs `pre` and then the program.
+fn with_pre(pane: Pane, pre: &[String]) -> Pane {
+    match pane.run {
+        None => Pane {
+            typed: pre.iter().cloned().chain(pane.typed).collect(),
+            ..pane
+        },
+        Some(argv) => Pane {
+            run: Some(
+                [
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("{}\nexec \"$@\"", pre.join("\n")),
+                    "sh".to_string(),
+                ]
+                .into_iter()
+                .chain(argv)
+                .collect(),
+            ),
+            ..pane
+        },
     }
 }
 
 /// A node is a pane, a split (`split:`), or a preset layout (`panes:`).
 /// None when `when` switched it off.
-fn parse_node(v: &Value, base: &Path) -> Result<Option<Node>> {
+fn parse_node(v: &Value, base: &Path, home: &Path) -> Result<Option<Node>> {
     let m = match v {
-        Value::Null | Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Sequence(_) => {
+        Value::Mapping(m) => m,
+        Value::Tagged(_) => bail!("YAML tags aren't supported"),
+        // A command, a list of commands, or nothing: a shell pane.
+        _ => {
             return Ok(Some(Node::Pane(Pane {
                 cwd: base.to_path_buf(),
                 typed: commands(Some(v), "pane")?,
                 ..Default::default()
             })));
         }
-        Value::Mapping(m) => m,
-        Value::Tagged(_) => bail!("YAML tags aren't supported"),
     };
     if let Some(w) = m.get("when")
         && !truthy(w)?
     {
         return Ok(None);
     }
-
     if m.contains_key("split") {
-        check_keys(
-            m,
-            &["split", "ratio", "before", "after", "root", "when"],
-            "a split",
-        )?;
-        let base = sub_root(m, base)?;
-        let direction = match scalar(&m["split"], "split")?.as_str() {
-            "horizontal" | "h" | "right" => Direction::Horizontal,
-            "vertical" | "v" | "below" | "down" => Direction::Vertical,
-            other => {
-                bail!("unknown split `{other}`: use `right` (side by side) or `below` (stacked)")
-            }
-        };
-        let ratio = match m.get("ratio") {
-            Some(r) => parse_ratio(r)?,
-            None => 0.5,
-        };
-        let side = |k: &str| -> Result<Option<Node>> {
-            let v = m
-                .get(k)
-                .ok_or_else(|| anyhow!("a split needs both `before` and `after`"))?;
-            parse_node(v, &base).with_context(|| format!("in `{k}`"))
-        };
-        // With one side switched off, the other side takes the whole space.
-        return Ok(match (side("before")?, side("after")?) {
-            (Some(before), Some(after)) => Some(Node::Split {
-                direction,
-                ratio,
-                before: Box::new(before),
-                after: Box::new(after),
-            }),
-            (one, other) => one.or(other),
-        });
+        parse_split(m, base, home)
+    } else if m.contains_key("panes") {
+        parse_panes(m, base, home)
+    } else {
+        parse_pane(m, base, home).map(|p| Some(Node::Pane(p)))
     }
+}
 
-    if m.contains_key("panes") {
-        check_keys(m, &["panes", "layout", "root", "when"], "a pane layout")?;
-        let base = sub_root(m, base)?;
-        let Some(Value::Sequence(items)) = m
-            .get("panes")
-            .filter(|p| p.as_sequence().is_some_and(|s| !s.is_empty()))
-        else {
-            bail!("`panes` must be a non-empty list");
-        };
-        let mut panes = Vec::new();
-        for (i, p) in items.iter().enumerate() {
-            if let Some(node) =
-                parse_node(p, &base).with_context(|| format!("in pane {}", i + 1))?
-            {
-                panes.push(node);
-            }
+fn parse_split(m: &Mapping, base: &Path, home: &Path) -> Result<Option<Node>> {
+    check_keys(
+        m,
+        &["split", "ratio", "before", "after", "root", "when"],
+        "a split",
+    )?;
+    let base = sub_root(m, base, home)?;
+    let direction = match scalar(&m["split"], "split")?.as_str() {
+        "horizontal" | "h" | "right" => Direction::Horizontal,
+        "vertical" | "v" | "below" | "down" => Direction::Vertical,
+        other => {
+            bail!("unknown split `{other}`: use `right` (side by side) or `below` (stacked)")
         }
-        if panes.is_empty() {
-            return Ok(None);
-        }
-        let spec = match m.get("layout") {
-            Some(l) => scalar(l, "layout")?,
-            None => "even-vertical".to_string(),
-        };
-        return layout::preset(&spec, panes).map(Some);
+    };
+    let ratio = m.get("ratio").map(parse_ratio).transpose()?.unwrap_or(0.5);
+    let side = |k: &str| -> Result<Option<Node>> {
+        let v = m
+            .get(k)
+            .ok_or_else(|| anyhow!("a split needs both `before` and `after`"))?;
+        parse_node(v, &base, home).with_context(|| format!("in `{k}`"))
+    };
+    // With one side switched off, the other side takes the whole space.
+    Ok(match (side("before")?, side("after")?) {
+        (Some(before), Some(after)) => Some(Node::split(direction, ratio, before, after)),
+        (one, other) => one.or(other),
+    })
+}
+
+fn parse_panes(m: &Mapping, base: &Path, home: &Path) -> Result<Option<Node>> {
+    check_keys(m, &["panes", "layout", "root", "when"], "a pane layout")?;
+    let base = sub_root(m, base, home)?;
+    let Some(items) = m
+        .get("panes")
+        .and_then(Value::as_sequence)
+        .filter(|s| !s.is_empty())
+    else {
+        bail!("`panes` must be a non-empty list");
+    };
+    let panes: Vec<Node> = items
+        .iter()
+        .enumerate()
+        .map(|(i, p)| parse_node(p, &base, home).with_context(|| format!("in pane {}", i + 1)))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    if panes.is_empty() {
+        return Ok(None);
     }
+    let spec = match m.get("layout") {
+        Some(l) => scalar(l, "layout")?,
+        None => "even-vertical".to_string(),
+    };
+    layout::preset(&spec, panes).map(Some)
+}
 
+fn parse_pane(m: &Mapping, base: &Path, home: &Path) -> Result<Pane> {
     check_keys(
         m,
         &["type", "run", "cwd", "label", "keep_open", "when"],
@@ -703,25 +594,21 @@ fn parse_node(v: &Value, base: &Path) -> Result<Option<Node>> {
         Some(Value::Sequence(_)) => Some(commands(m.get("run"), "run")?),
         Some(v) => Some(vec!["sh".into(), "-c".into(), scalar(v, "run")?]),
     };
-    let keep_open = match m.get("keep_open") {
-        None => false,
-        Some(v) => truthy(v)?,
-    };
-    Ok(Some(Node::Pane(Pane {
+    Ok(Pane {
         cwd: match m.get("cwd") {
-            Some(c) => join(base, &scalar(c, "cwd")?),
+            Some(c) => join(home, base, &scalar(c, "cwd")?),
             None => base.to_path_buf(),
         },
         label: m.get("label").map(|l| scalar(l, "label")).transpose()?,
         typed: commands(m.get("type"), "type")?,
         run,
-        keep_open,
-    })))
+        keep_open: m.get("keep_open").map(truthy).transpose()?.unwrap_or(false),
+    })
 }
 
-fn sub_root(m: &Mapping, base: &Path) -> Result<PathBuf> {
+fn sub_root(m: &Mapping, base: &Path, home: &Path) -> Result<PathBuf> {
     Ok(match m.get("root") {
-        Some(r) => join(base, &scalar(r, "root")?),
+        Some(r) => join(home, base, &scalar(r, "root")?),
         None => base.to_path_buf(),
     })
 }
@@ -740,150 +627,14 @@ fn parse_ratio(v: &Value) -> Result<f64> {
     Ok(r)
 }
 
-/// Expand `~` and resolve `path` against `base`.
-pub fn join(base: &Path, path: &str) -> PathBuf {
-    let p = if path == "~" {
-        home()
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        home().join(rest)
-    } else {
-        PathBuf::from(path)
+/// `path` with `~` expanded, resolved against `base`.
+pub fn join(home: &Path, base: &Path, path: &str) -> PathBuf {
+    let path = match path.strip_prefix('~') {
+        Some("") => home.to_path_buf(),
+        Some(rest) if rest.starts_with('/') => home.join(&rest[1..]),
+        _ => PathBuf::from(path),
     };
-    let p = if p.is_absolute() { p } else { base.join(p) };
-    // Drops `.` components, so `/a/./b` becomes `/a/b`.
-    p.components().collect()
-}
-
-pub fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
-}
-
-fn scalar(v: &Value, what: &str) -> Result<String> {
-    match v {
-        Value::String(s) => Ok(s.clone()),
-        Value::Number(n) => Ok(n.to_string()),
-        Value::Bool(b) => Ok(b.to_string()),
-        _ => bail!("`{what}` must be a single value"),
-    }
-}
-
-/// Null → none; a value → one command; a list → several.
-fn commands(v: Option<&Value>, what: &str) -> Result<Vec<String>> {
-    match v {
-        None | Some(Value::Null) => Ok(vec![]),
-        Some(Value::Sequence(items)) => items.iter().map(|i| scalar(i, what)).collect(),
-        Some(v) => Ok(vec![scalar(v, what)?]),
-    }
-}
-
-fn check_keys(m: &Mapping, allowed: &[&str], what: &str) -> Result<()> {
-    for k in m.keys() {
-        let k = scalar(k, "key")?;
-        if !allowed.contains(&k.as_str()) {
-            bail!(
-                "unknown key `{k}` in {what} (expected one of: {})",
-                allowed.join(", ")
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Defaults from `vars:`, overridden on the command line. A default can use
-/// earlier variables and environment variables.
-fn resolve_vars(
-    vars: Option<&Value>,
-    overrides: &HashMap<String, String>,
-) -> Result<HashMap<String, String>> {
-    let mut out = HashMap::new();
-    let Some(vars) = vars else { return Ok(out) };
-    let Value::Mapping(vars) = vars else {
-        bail!("`vars` must be a mapping of names to defaults")
-    };
-    for (k, v) in vars {
-        let name = scalar(k, "variable name")?;
-        let value = match overrides.get(&name) {
-            Some(o) => o.clone(),
-            None => {
-                let raw = if v.is_null() {
-                    String::new()
-                } else {
-                    scalar(v, &name)?
-                };
-                let lookup = |n: &str| {
-                    overrides
-                        .get(n)
-                        .or_else(|| out.get(n))
-                        .cloned()
-                        .or_else(|| std::env::var(n).ok())
-                };
-                substitute(&raw, &lookup).with_context(|| format!("in variable `{name}`"))?
-            }
-        };
-        out.insert(name, value);
-    }
-    Ok(out)
-}
-
-fn subst_value(v: Value, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Value> {
-    Ok(match v {
-        Value::String(s) => Value::String(substitute(&s, lookup)?),
-        Value::Sequence(items) => Value::Sequence(
-            items
-                .into_iter()
-                .map(|i| subst_value(i, lookup))
-                .collect::<Result<_>>()?,
-        ),
-        Value::Mapping(m) => {
-            let mut out = Mapping::new();
-            for (k, v) in m {
-                out.insert(subst_value(k, lookup)?, subst_value(v, lookup)?);
-            }
-            Value::Mapping(out)
-        }
-        other => other,
-    })
-}
-
-/// Replace `${name}` and `${name:-default}`. `$$` is a literal `$`. A bare
-/// `$NAME` is left alone so the shell can expand it.
-pub fn substitute(s: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<String> {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = rest.find('$') {
-        out.push_str(&rest[..i]);
-        let after = &rest[i + 1..];
-        if let Some(r) = after.strip_prefix('$') {
-            out.push('$');
-            rest = r;
-        } else if let Some(r) = after.strip_prefix('{') {
-            let end = r
-                .find('}')
-                .ok_or_else(|| anyhow!("unclosed `${{` in {s:?}"))?;
-            let expr = &r[..end];
-            let (name, default) = match expr.split_once(":-") {
-                Some((n, d)) => (n, Some(d)),
-                None => (expr, None),
-            };
-            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                bail!("bad variable name `{name}` in {s:?}");
-            }
-            let value = lookup(name)
-                .or_else(|| default.map(String::from))
-                .ok_or_else(|| {
-                    anyhow!("unknown variable `{name}`: add it to `vars`, or pass {name}=VALUE")
-                })?;
-            out.push_str(&value);
-            rest = &r[end + 1..];
-        } else {
-            out.push('$');
-            rest = after;
-        }
-    }
-    out.push_str(rest);
-    Ok(out)
+    env::absolute(base, &path)
 }
 
 #[cfg(test)]
@@ -905,12 +656,27 @@ mod tests {
         }
     }
 
+    fn parse(text: &str, overlay: Option<&str>, request: &Request) -> Result<Project> {
+        let no_env = |_: &str| None;
+        let cx = Context {
+            home: Path::new("/home/me"),
+            env: &no_env,
+        };
+        let doc = yaml::mapping(serde_yaml::from_str(text)?, "a project file")?;
+        let overlay = overlay.map(serde_yaml::from_str).transpose()?;
+        build(doc, overlay, request, &defaults(), &cx)
+    }
+
     fn p(src: &str) -> Result<Project> {
-        parse(src, None, &HashMap::new(), &defaults(), None)
+        parse(src, None, &Request::default())
     }
 
     fn pv(src: &str, pairs: &[(&str, &str)], layout: Option<&str>) -> Result<Project> {
-        parse(src, None, &vars(pairs), &defaults(), layout)
+        let request = Request {
+            vars: vars(pairs),
+            layout: layout.map(String::from),
+        };
+        parse(src, None, &request)
     }
 
     fn pane(n: &Node) -> &Pane {
@@ -922,25 +688,6 @@ mod tests {
 
     fn window_names(p: &Project) -> Vec<&str> {
         p.windows.iter().map(|w| w.name.as_str()).collect()
-    }
-
-    fn sub(s: &str, pairs: &[(&str, &str)]) -> Result<String> {
-        let m = vars(pairs);
-        substitute(s, &|n| m.get(n).cloned())
-    }
-
-    #[test]
-    fn substitutes_variables() {
-        assert_eq!(sub("a-${x}-b", &[("x", "1")]).unwrap(), "a-1-b");
-        assert_eq!(sub("${y:-dflt}", &[]).unwrap(), "dflt");
-        assert_eq!(sub("$$HOME and $PATH", &[]).unwrap(), "$HOME and $PATH");
-        assert!(
-            sub("${nope}", &[])
-                .unwrap_err()
-                .to_string()
-                .contains("unknown variable `nope`")
-        );
-        assert!(sub("${open", &[]).is_err());
     }
 
     const SHOP: &str = r#"
@@ -962,8 +709,8 @@ windows:
         let p = pv(SHOP, &[("env", "staging")], None).unwrap();
         assert_eq!(p.name, "shop-staging");
         assert_eq!(p.root, PathBuf::from("/srv/shop"));
-        assert_eq!(p.on_first_start, vec!["docker compose up -d"]);
-        assert!(p.on_start.is_empty());
+        assert_eq!(p.hooks.on_first_start, vec!["docker compose up -d"]);
+        assert!(p.hooks.on_start.is_empty());
         assert_eq!(p.windows.len(), 3);
         let server = pane(&p.windows[1].layout);
         assert_eq!(server.typed, vec!["PORT=3000 NODE_ENV=staging npm run dev"]);
@@ -981,29 +728,43 @@ windows:
     }
 
     #[test]
-    fn vars_can_use_earlier_vars_and_overrides() {
-        let src = "vars: {port: 3000, url: 'http://x:${port}'}\nwindows: [{w: '${url}'}]";
-        let p = pv(src, &[("port", "9")], None).unwrap();
-        assert_eq!(pane(&p.windows[0].layout).typed, vec!["http://x:9"]);
+    fn home_and_relative_paths() {
+        let p = p("root: ~/code\nwindows: [{a: {cwd: ./sub, type: x}}, {b: {cwd: '~', type: y}}]")
+            .unwrap();
+        assert_eq!(p.root, PathBuf::from("/home/me/code"));
+        assert_eq!(
+            pane(&p.windows[0].layout).cwd,
+            PathBuf::from("/home/me/code/sub")
+        );
+        assert_eq!(pane(&p.windows[1].layout).cwd, PathBuf::from("/home/me"));
+    }
+
+    #[test]
+    fn env_vars_are_the_last_lookup() {
+        let env = |n: &str| (n == "USER").then(|| "ana".to_string());
+        let cx = Context {
+            home: Path::new("/h"),
+            env: &env,
+        };
+        let doc =
+            serde_yaml::from_str("vars: {who: '${USER}'}\nwindows: [{w: 'hi ${who} ${USER}'}]")
+                .unwrap();
+        let p = build(doc, None, &Request::default(), &defaults(), &cx).unwrap();
+        assert_eq!(pane(&p.windows[0].layout).typed, vec!["hi ana ana"]);
     }
 
     #[test]
     fn local_file_overrides_keys_and_merges_vars() {
         let src = "vars: {a: 1, b: 2}\nwindows: [{w: '${a} ${b}'}]";
-        let overlay = serde_yaml::from_str("vars: {b: 20}\nname: mine").unwrap();
-        let p = parse(src, Some(overlay), &HashMap::new(), &defaults(), None).unwrap();
+        let p = parse(src, Some("vars: {b: 20}\nname: mine"), &Request::default()).unwrap();
         assert_eq!(p.name, "mine");
         assert_eq!(pane(&p.windows[0].layout).typed, vec!["1 20"]);
         // The command line still wins over the .local file.
-        let overlay = serde_yaml::from_str("vars: {b: 20}").unwrap();
-        let p = parse(
-            src,
-            Some(overlay),
-            &vars(&[("b", "cli")]),
-            &defaults(),
-            None,
-        )
-        .unwrap();
+        let request = Request {
+            vars: vars(&[("b", "cli")]),
+            layout: None,
+        };
+        let p = parse(src, Some("vars: {b: 20}"), &request).unwrap();
         assert_eq!(pane(&p.windows[0].layout).typed, vec!["1 cli"]);
     }
 
@@ -1106,27 +867,16 @@ windows:
 
     #[test]
     fn startup_window_and_pane() {
-        assert_eq!(
-            p("startup_window: b\nwindows: [{a: x}, {b: y}]")
-                .unwrap()
-                .startup_window,
-            1
-        );
-        assert_eq!(
-            p("startup_window: 1\nwindows: [{a: x}, {b: y}]")
-                .unwrap()
-                .startup_window,
-            0
-        );
+        let first = |src: &str| p(src).unwrap().startup_window;
+        assert_eq!(first("startup_window: b\nwindows: [{a: x}, {b: y}]"), 1);
+        assert_eq!(first("startup_window: 1\nwindows: [{a: x}, {b: y}]"), 0);
         assert!(p("startup_window: 3\nwindows: [{a: x}, {b: y}]").is_err());
 
         let src = "startup_window: b\nstartup_pane: PANE\nwindows: [{a: x}, {b: {panes: [x, {label: logs}, z]}}]";
-        assert_eq!(
-            p(&src.replace("PANE", "logs")).unwrap().startup_pane,
-            Some(1)
-        );
-        assert_eq!(p(&src.replace("PANE", "3")).unwrap().startup_pane, Some(2));
-        let err = p(&src.replace("PANE", "nope")).unwrap_err();
+        let pane_of = |which: &str| p(&src.replace("PANE", which)).map(|p| p.startup_pane);
+        assert_eq!(pane_of("logs").unwrap(), Some(1));
+        assert_eq!(pane_of("3").unwrap(), Some(2));
+        let err = pane_of("nope").unwrap_err();
         assert!(err.to_string().contains("window `b`"), "{err}");
     }
 
@@ -1144,20 +894,21 @@ windows:
 
     #[test]
     fn defaults_for_project_files() {
-        let d = defaults_for(Path::new("/git/myapp/.rexinator.yml")).unwrap();
+        let cwd = Path::new("/here");
+        let d = defaults_for(Path::new("/git/myapp/.rexinator.yml"), cwd);
         assert_eq!(
             (d.name.as_str(), d.root.as_path()),
             ("myapp", Path::new("/git/myapp"))
         );
-        let d = defaults_for(Path::new("/git/myapp/.rexinator/backend.yml")).unwrap();
+        let d = defaults_for(Path::new("/git/myapp/.rexinator/backend.yml"), cwd);
         assert_eq!(
             (d.name.as_str(), d.root.as_path()),
             ("myapp-backend", Path::new("/git/myapp"))
         );
-        let d = defaults_for(Path::new("/git/myapp/.rexinator/default.yml")).unwrap();
+        let d = defaults_for(Path::new("/git/myapp/.rexinator/default.yml"), cwd);
         assert_eq!(d.name, "myapp");
-        let d = defaults_for(Path::new("/home/me/.config/rexinator/shop.yml")).unwrap();
-        assert_eq!(d.name, "shop");
+        let d = defaults_for(Path::new("/home/me/.config/rexinator/shop.yml"), cwd);
+        assert_eq!((d.name.as_str(), d.root.as_path()), ("shop", cwd));
         assert_eq!(
             project_dir_of(Path::new("/home/me/.config/rexinator/shop.yml")),
             None
@@ -1223,13 +974,13 @@ layouts:
         );
         assert!(pv("windows: [{w: x}]", &[], Some("a")).is_err());
         assert!(p("default: c\nlayouts: {a: {windows: [{w: x}]}}").is_err());
+        assert!(p("layouts: {}").is_err());
     }
 
     #[test]
     fn local_file_can_add_a_layout_and_change_the_default() {
-        let overlay =
-            serde_yaml::from_str("default: mine\nlayouts: {mine: {windows: [{me: x}]}}").unwrap();
-        let p = parse(LAYOUTS, Some(overlay), &HashMap::new(), &defaults(), None).unwrap();
+        let overlay = "default: mine\nlayouts: {mine: {windows: [{me: x}]}}";
+        let p = parse(LAYOUTS, Some(overlay), &Request::default()).unwrap();
         assert_eq!(p.layout.as_deref(), Some("mine"));
         assert_eq!(p.layouts, vec!["focus", "full", "mine"]);
         assert_eq!(p.name, "shop");
@@ -1253,91 +1004,57 @@ windows:
       before: { when: '${db}', type: a }
       after: b
 "#;
+        let first_commands = |w: &Window| -> Vec<String> {
+            w.layout
+                .panes()
+                .iter()
+                .map(|p| p.typed[0].clone())
+                .collect()
+        };
         let p = pv(src, &[], None).unwrap();
         assert_eq!(window_names(&p), ["code", "dev", "side"]);
         // The startup window is switched off, so the first one shows.
         assert_eq!(p.startup_window, 0);
-        let dev: Vec<_> = p.windows[1]
-            .layout
-            .panes()
-            .iter()
-            .map(|p| p.typed[0].clone())
-            .collect();
-        assert_eq!(dev, ["serve", "tail -f log"]);
+        assert_eq!(first_commands(&p.windows[1]), ["serve", "tail -f log"]);
         // One side of the split is off: the other side fills the window.
         assert_eq!(pane(&p.windows[2].layout).typed, vec!["b"]);
 
         let p = pv(src, &[("db", "yes"), ("logs", "0")], None).unwrap();
         assert_eq!(window_names(&p), ["code", "db", "dev", "side"]);
         assert_eq!(p.startup_window, 1);
-        let dev: Vec<_> = p.windows[2]
-            .layout
-            .panes()
-            .iter()
-            .map(|p| p.typed[0].clone())
-            .collect();
-        assert_eq!(dev, ["serve", "echo no logs"]);
+        assert_eq!(first_commands(&p.windows[2]), ["serve", "echo no logs"]);
         assert!(matches!(p.windows[3].layout, Node::Split { .. }));
     }
 
     #[test]
-    fn when_compares_values() {
-        let on = |s: &str| truthy(&Value::String(s.into())).unwrap();
-        assert!(on("staging == staging"));
-        assert!(on("staging == \"staging\""));
-        assert!(on("dev != prod"));
-        assert!(!on("dev == prod"));
-        assert!(!on("prod != prod"));
-        assert!(on(" == ''"));
-        // The first operator decides: this compares `a` with `b == c`.
-        assert!(on("a != b == c"));
-
+    fn when_compares_and_combines_values() {
         let src = r#"
-vars: {env: dev}
+vars: {env: dev, with_db: false}
 windows:
   - always: x
   - prod: { when: '${env} == prod', type: careful }
   - not-prod:
       when: ${env} != prod
       panes: [y]
-"#;
-        assert_eq!(
-            window_names(&pv(src, &[], None).unwrap()),
-            ["always", "not-prod"]
-        );
-        assert_eq!(
-            window_names(&pv(src, &[("env", "prod")], None).unwrap()),
-            ["always", "prod"]
-        );
-    }
-
-    #[test]
-    fn when_combines_terms_with_and_or() {
-        let on = |s: &str| truthy(&Value::String(s.into())).unwrap();
-        assert!(on("true && yes"));
-        assert!(!on("true && false"));
-        assert!(on("false || 1"));
-        assert!(!on("no || off"));
-        assert!(on("dev == dev && !false"));
-        assert!(on("a == b || c != d"));
-        // && binds tighter: false || (true && true).
-        assert!(on("false || true && true"));
-        // true && (false || ...) would be false; this is (true && false) || true.
-        assert!(on("true && false || true"));
-        assert!(!on("true && false || false"));
-
-        let src = r#"
-vars: {env: dev, with_db: false}
-windows:
-  - always: x
   - db: { when: '${with_db} && ${env} != prod', type: psql }
   - ci: { when: '${env} == ci || ${env} == staging', type: run-ci }
 "#;
-        assert_eq!(window_names(&pv(src, &[], None).unwrap()), ["always"]);
-        let p = pv(src, &[("with_db", "yes"), ("env", "staging")], None).unwrap();
-        assert_eq!(window_names(&p), ["always", "db", "ci"]);
-        let p = pv(src, &[("with_db", "yes"), ("env", "prod")], None).unwrap();
-        assert_eq!(window_names(&p), ["always"]);
+        let names = |pairs: &[(&str, &str)]| -> Vec<String> {
+            window_names(&pv(src, pairs, None).unwrap())
+                .into_iter()
+                .map(String::from)
+                .collect()
+        };
+        assert_eq!(names(&[]), ["always", "not-prod"]);
+        assert_eq!(names(&[("env", "prod")]), ["always", "prod"]);
+        assert_eq!(
+            names(&[("with_db", "yes"), ("env", "staging")]),
+            ["always", "not-prod", "db", "ci"]
+        );
+        assert_eq!(
+            names(&[("with_db", "yes"), ("env", "prod")]),
+            ["always", "prod"]
+        );
     }
 
     #[test]
@@ -1351,30 +1068,40 @@ windows:
     }
 
     #[test]
-    fn extends_merges_files() {
-        let dir = std::env::temp_dir().join(format!("rexinator-test-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join(LOCAL_DIR)).unwrap();
-        std::fs::write(
-            dir.join(LOCAL_DIR).join("_base.yml"),
-            "vars: {a: 1, b: 2}\npre_window: echo base\nwindows: [{w: base}]",
-        )
-        .unwrap();
-        let file = dir.join(LOCAL_DIR).join("api.yml");
-        std::fs::write(
-            &file,
-            "extends: _base\nvars: {b: 3}\nwindows: [{api: 'serve ${a} ${b}'}]",
-        )
-        .unwrap();
-
-        let p = load(&file, &HashMap::new(), None).unwrap();
-        let folder = dir.file_name().unwrap().to_str().unwrap();
-        assert_eq!(p.name, format!("{folder}-api"));
-        assert_eq!(p.root, dir);
+    fn load_applies_extends_and_local_overrides() {
+        let fs = Fs::memory(&[
+            (
+                "/git/app/.rexinator/_base.yml",
+                "vars: {a: 1, b: 2}\npre_window: echo base\nwindows: [{w: base}]",
+            ),
+            (
+                "/git/app/.rexinator/api.yml",
+                "extends: _base\nvars: {b: 3, c: x}\nwindows: [{api: 'serve ${a} ${b} ${c}'}]",
+            ),
+            ("/git/app/.rexinator/api.local.yml", "vars: {c: mine}"),
+        ]);
+        let env = Env::new(PathBuf::from("/git/app/src"), HashMap::new());
+        let p = load(
+            &fs,
+            &env,
+            Path::new("../.rexinator/api.yml"),
+            &Request::default(),
+        );
+        let p = p.unwrap();
+        assert_eq!(p.name, "app-api");
+        assert_eq!(p.root, PathBuf::from("/git/app"));
         assert_eq!(window_names(&p), ["api"]);
         assert_eq!(
             pane(&p.windows[0].layout).typed,
-            vec!["echo base", "serve 1 3"]
+            vec!["echo base", "serve 1 3 mine"]
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extends_loops_are_caught() {
+        let fs = Fs::memory(&[("/c/a.yml", "extends: b"), ("/c/b.yml", "extends: a")]);
+        let env = Env::new(PathBuf::from("/"), HashMap::new());
+        let err = load(&fs, &env, Path::new("/c/a.yml"), &Request::default()).unwrap_err();
+        assert!(format!("{err:#}").contains("loop"), "{err:#}");
     }
 }
