@@ -157,7 +157,7 @@ side. To name sessions yourself, use `${layout}` in `name`, or set `name` in the
 `when:` on a window or a pane includes it only when its value is on. `false`, `no`, `off`, `0`
 and an empty value are off; anything else is on, and a leading `!` flips it. `A == B` and
 `A != B` compare text instead, after variables are filled in; quotes around either side are
-optional:
+optional. `&&` and `||` combine these, with `&&` binding tighter (there are no parentheses):
 
 ```yaml
 vars:
@@ -171,7 +171,13 @@ windows:
   - deploy:
       when: ${env} == prod                         # rexinator start env=prod
       panes: [./deploy.sh --dry-run]
+  - seed:
+      when: ${with_db} && ${env} != prod           # never seed production
+      panes: [./seed.sh]
 ```
+
+Conditions are checked after variables are filled in, so a variable whose value contains `==`,
+`!=`, `&&` or `||` changes the condition's meaning.
 
 When one side of a split is switched off, the other side fills the space. If `startup_window`
 names a window that's switched off, the first window is shown instead.

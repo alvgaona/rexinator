@@ -484,28 +484,34 @@ fn merge(base: &mut Mapping, top: Mapping) {
     }
 }
 
-/// Whether a `when` value switches something on. `A == B` and `A != B`
-/// compare text. Otherwise it's off for false, no, off, 0 and empty, and a
-/// leading `!` flips it.
+/// Whether a `when` value switches something on. `||` and `&&` combine
+/// terms, with `&&` binding tighter. Each term is a comparison (`A == B`,
+/// `A != B`) or a value, which is off for false, no, off, 0 and empty; a
+/// leading `!` flips a value.
 fn truthy(v: &Value) -> Result<bool> {
     let s = match v {
         Value::Bool(b) => return Ok(*b),
         Value::Null => return Ok(false),
         v => scalar(v, "when")?,
     };
-    if let Some(result) = compare(&s) {
-        return Ok(result);
+    Ok(s.split("||").any(|any| any.split("&&").all(term_on)))
+}
+
+/// One term of a `when` value: a comparison, or a value with an optional `!`.
+fn term_on(term: &str) -> bool {
+    if let Some(result) = compare(term) {
+        return result;
     }
-    let s = s.trim();
-    let (negate, s) = match s.strip_prefix('!') {
+    let term = term.trim();
+    let (negate, term) = match term.strip_prefix('!') {
         Some(rest) => (true, rest.trim()),
-        None => (false, s),
+        None => (false, term),
     };
     let on = !matches!(
-        s.to_ascii_lowercase().as_str(),
+        term.to_ascii_lowercase().as_str(),
         "" | "false" | "no" | "off" | "0"
     );
-    Ok(on != negate)
+    on != negate
 }
 
 /// `A == B` or `A != B`, if `s` is a comparison. The first operator wins, and
@@ -1303,6 +1309,35 @@ windows:
             window_names(&pv(src, &[("env", "prod")], None).unwrap()),
             ["always", "prod"]
         );
+    }
+
+    #[test]
+    fn when_combines_terms_with_and_or() {
+        let on = |s: &str| truthy(&Value::String(s.into())).unwrap();
+        assert!(on("true && yes"));
+        assert!(!on("true && false"));
+        assert!(on("false || 1"));
+        assert!(!on("no || off"));
+        assert!(on("dev == dev && !false"));
+        assert!(on("a == b || c != d"));
+        // && binds tighter: false || (true && true).
+        assert!(on("false || true && true"));
+        // true && (false || ...) would be false; this is (true && false) || true.
+        assert!(on("true && false || true"));
+        assert!(!on("true && false || false"));
+
+        let src = r#"
+vars: {env: dev, with_db: false}
+windows:
+  - always: x
+  - db: { when: '${with_db} && ${env} != prod', type: psql }
+  - ci: { when: '${env} == ci || ${env} == staging', type: run-ci }
+"#;
+        assert_eq!(window_names(&pv(src, &[], None).unwrap()), ["always"]);
+        let p = pv(src, &[("with_db", "yes"), ("env", "staging")], None).unwrap();
+        assert_eq!(window_names(&p), ["always", "db", "ci"]);
+        let p = pv(src, &[("with_db", "yes"), ("env", "prod")], None).unwrap();
+        assert_eq!(window_names(&p), ["always"]);
     }
 
     #[test]
