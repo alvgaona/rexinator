@@ -9,8 +9,16 @@
 
 Start Rex sessions from project files, like tmuxinator does for tmux.
 
+## Installation
+
 ```sh
-cargo install --path .
+cargo install rexinator
+```
+
+Or from source:
+
+```sh
+cargo install --git https://github.com/alvgaona/rexinator
 ```
 
 ## Usage
