@@ -1,0 +1,12 @@
+[package]
+name = "rexinator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anstream = "1"
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_yaml = "0.9.34"

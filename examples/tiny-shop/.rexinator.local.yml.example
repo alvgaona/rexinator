@@ -1,0 +1,3 @@
+# Copy to .rexinator.local.yml for personal settings. It's ignored by git.
+vars:
+  port: 9000

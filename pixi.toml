@@ -1,0 +1,42 @@
+[workspace]
+authors = ["Alvaro Gaona <alvgaona@gmail.com>"]
+channels = ["conda-forge"]
+name = "rexinator"
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+version = "0.1.0"
+
+# Cargo comes from rustup, not pixi.
+[tasks.build]
+cmd = "cargo build"
+description = "Build rexinator"
+
+[tasks.test]
+cmd = "cargo test"
+description = "Run the tests"
+
+[tasks.fmt]
+cmd = "cargo fmt"
+description = "Format the code"
+
+[tasks.install]
+cmd = "cargo install --path ."
+description = "Install rexinator into ~/.cargo/bin"
+
+[feature.lint.dependencies]
+commitlint = ">=21.2"
+lefthook = ">=2.2"
+
+[feature.lint.tasks.install-hooks]
+cmd = "lefthook install"
+description = "Install the git hooks (once per clone)"
+
+[feature.lint.tasks.lint]
+cmd = "lefthook run pre-commit --all-files"
+description = "Run the pre-commit checks on every file"
+
+[feature.lint.tasks.lint-commit]
+cmd = "commitlint --last --verbose"
+description = "Check the last commit's message"
+
+[environments]
+lint = { features = ["lint"], no-default-feature = true }

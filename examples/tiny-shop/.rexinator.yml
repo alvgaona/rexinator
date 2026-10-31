@@ -1,0 +1,59 @@
+# Run `rexinator start` anywhere in this folder.
+#   rexinator start                          the full layout, env=dev on port 8000
+#   rexinator start @focus                   editor, server and tests only
+#   rexinator start env=staging port=8001    a second copy, side by side
+#   rexinator start watch_logs=false         the full layout without the logs tab
+name: tiny-shop-${env}
+
+vars:
+  env: dev
+  port: 8000
+  url: http://localhost:${port}
+  logs: logs/${env}-${layout}   # each environment and layout logs separately
+  watch_logs: true
+
+# Every pane gets these, so server.py and worker.py read the right settings.
+pre_window: export APP_ENV=${env} PORT=${port} LOG_DIR=${logs}
+
+on_first_start: 'mkdir -p ${logs} && echo "tiny-shop: starting a fresh ${env} session (${layout})"'
+on_restart: 'echo "tiny-shop: ${env} is already running, switching to it"'
+on_stop: 'rm -rf ${logs} && rmdir logs 2>/dev/null; echo "tiny-shop: removed ${logs}"'
+
+default: full
+layouts:
+  full:
+    startup_window: dev
+    startup_pane: server
+    windows:
+      - code: ${EDITOR:-vi} shop.py
+
+      # The server on the left, the worker and a quick check of the page on the right.
+      - dev:
+          layout: main-left 60
+          panes:
+            - { label: server, type: python3 server.py }
+            - { label: worker, type: python3 worker.py }
+            - { label: check, type: "sleep 1 && curl -s ${url}; echo" }
+
+      # Both log files, side by side. `run` panes close when you stop tail.
+      - logs:
+          when: ${watch_logs}
+          split: right
+          before: { label: requests, run: "tail -F ${logs}/server.log" }
+          after: { label: orders, run: "tail -F ${logs}/worker.log" }
+
+      - tests: python3 -m unittest -v
+
+  # For a small screen: the editor with the server beside it. Its session is
+  # tiny-shop-dev-focus, so it uses another port and can run next to `full`.
+  focus:
+    vars:
+      port: 8002
+    startup_pane: server
+    windows:
+      - code:
+          split: right
+          ratio: 65
+          before: ${EDITOR:-vi} shop.py
+          after: { label: server, type: python3 server.py }
+      - tests: python3 -m unittest -v
