@@ -17,6 +17,13 @@ rexinator list            # projects, and which are running
 
 `rexinator --help` lists every command.
 
+For tab completion of commands, project names and layouts, add this to your shell's startup file:
+
+```sh
+eval "$(rexinator completions zsh)"          # ~/.zshrc (use bash in ~/.bashrc)
+rexinator completions fish | source          # ~/.config/fish/config.fish
+```
+
 ### Example
 
 ```yaml

@@ -282,12 +282,6 @@ pub fn list(world: &World) -> Result<()> {
     Ok(())
 }
 
-pub fn names(world: &World) {
-    discovery::project_names(&world.fs, &world.env)
-        .iter()
-        .for_each(|n| println!("{n}"));
-}
-
 /// Open a project file in the editor, creating it from a template first if needed.
 pub fn edit(world: &World, name: Option<&str>, here: bool) -> Result<()> {
     let (path, kind) = discovery::edit_target(&world.fs, &world.env, name, here);

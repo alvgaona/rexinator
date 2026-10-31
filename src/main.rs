@@ -7,12 +7,13 @@
 //! - Pure core: [`yaml`], [`vars`], [`when`], [`project`] and [`layout`]
 //!   turn files into a [`model::Project`] and Rex requests; [`discovery`]
 //!   finds project files; [`plan`] decides what each command does; [`report`]
-//!   renders output. They read files only through the [`fs::Fs`] they're given.
+//!   renders output; [`complete`] answers shell completion. They read files
+//!   only through the [`fs::Fs`] they're given.
 //! - Shell: [`commands`] and [`rex`] run programs, write files and print.
 
 mod cli;
 mod commands;
-mod completions;
+mod complete;
 mod discovery;
 mod env;
 mod fs;
@@ -38,6 +39,9 @@ use commands::World;
 use style::Color;
 
 fn main() {
+    // Answers the shell's completion requests (`COMPLETE=zsh rexinator ...`) and exits.
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+
     // Resolved from the raw arguments so help and parse errors are already
     // colorized (or not) by the time clap renders them.
     let color = Color::from_raw_args();
@@ -74,16 +78,12 @@ fn run(cli: Cli) -> Result<()> {
             commands::stop_one(&world, &commands::load(&world, &target)?.project)
         }
         Cmd::Debug { target } => commands::debug(&commands::load(&world, &target)?),
-        Cmd::List { names: true } => {
-            commands::names(&world);
-            Ok(())
-        }
-        Cmd::List { names: false } => commands::list(&world),
+        Cmd::List => commands::list(&world),
         Cmd::Edit { name, here } => commands::edit(&world, name.as_deref(), here),
         Cmd::Copy { from, to } => commands::copy(&world, &from, &to),
         Cmd::Delete { name, yes } => commands::delete(&world, &name, yes),
         Cmd::Completions { shell } => {
-            print!("{}", completions::completions(shell));
+            print!("{}", complete::registration(shell.name())?);
             Ok(())
         }
     }

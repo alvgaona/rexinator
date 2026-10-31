@@ -3,7 +3,9 @@
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use clap_complete::ArgValueCandidates;
 
+use crate::complete;
 use crate::project::Request;
 use crate::style::{self, Color};
 
@@ -33,7 +35,8 @@ pub struct Target {
     // In `help` rather than a doc comment, so rustdoc doesn't read the brackets as links.
     #[arg(
         value_name = "ARGS",
-        help = "[PROJECT] [@LAYOUT] [KEY=VALUE]... PROJECT is a name, a file, or a project folder"
+        help = "[PROJECT] [@LAYOUT] [KEY=VALUE]... PROJECT is a name, a file, or a project folder",
+        add = ArgValueCandidates::new(complete::targets)
     )]
     pub args: Vec<String>,
 }
@@ -67,11 +70,7 @@ pub enum Cmd {
     },
     /// List projects and whether they're running
     #[command(alias = "ls")]
-    List {
-        /// Print only project names, for shell completion
-        #[arg(long, hide = true)]
-        names: bool,
-    },
+    List,
     /// Open a project file in $EDITOR, creating it from a template first if needed
     ///
     /// With no NAME, uses this project's .rexinator.yml. A NAME is looked up in
@@ -79,6 +78,7 @@ pub enum Cmd {
     /// goes in the config folder unless you pass --here.
     #[command(alias = "new", alias = "open")]
     Edit {
+        #[arg(add = ArgValueCandidates::new(complete::projects))]
         name: Option<String>,
         /// Create it in this project: ./.rexinator.yml, or .rexinator/NAME.yml with a NAME
         #[arg(long)]
@@ -86,16 +86,24 @@ pub enum Cmd {
     },
     /// Copy a project file to a new name
     #[command(alias = "cp")]
-    Copy { from: String, to: String },
+    Copy {
+        #[arg(add = ArgValueCandidates::new(complete::projects))]
+        from: String,
+        to: String,
+    },
     /// Delete a project file
     #[command(alias = "rm")]
     Delete {
+        #[arg(add = ArgValueCandidates::new(complete::projects))]
         name: String,
         /// Don't ask first
         #[arg(short, long)]
         yes: bool,
     },
     /// Print a shell completion script, e.g. `eval "$(rexinator completions zsh)"`
+    ///
+    /// Load it when the shell starts rather than saving it to a file, so it
+    /// stays in step with rexinator after upgrades.
     Completions { shell: Shell },
 }
 
@@ -104,6 +112,20 @@ pub enum Shell {
     Bash,
     Zsh,
     Fish,
+    Elvish,
+    Powershell,
+}
+
+impl Shell {
+    pub fn name(self) -> &'static str {
+        match self {
+            Shell::Bash => "bash",
+            Shell::Zsh => "zsh",
+            Shell::Fish => "fish",
+            Shell::Elvish => "elvish",
+            Shell::Powershell => "powershell",
+        }
+    }
 }
 
 /// The PROJECT argument, and the layout and variables asked for.
